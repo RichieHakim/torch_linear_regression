@@ -34,17 +34,34 @@ pip install git+https://github.com/RichieHakim/torch_linear_regression.git
 ```
 
 ## Usage 
+See the notebook for more examples: [demo notebook](https://github.com/RichieHakim/torch_linear_regression/blob/master/demo_notebook.ipynb)
 ```
 import torch_linear_regression as tlr
 
-# Generate some data
-X = torch.randn(100, 10)
-Y = torch.randn(100, 2)
-
-# Fit OLS model
-ols = tlr.OLS()
-ols.fit(X, Y)
-Y_pred = ols.predict(X)
+import torch
+import numpy as np
+import sklearn
+import sklearn.datasets
+import matplotlib.pyplot as plt
 
 
+## Generate data for regression
+X, Y = sklearn.datasets.make_regression(
+    n_samples=100,
+    n_features=2,
+    n_informative=10,
+    bias=2,
+    noise=50,
+    random_state=42,
+)
+
+## Create model
+model_ols = tlr.OLS()
+## Fit model
+model_ols.fit(X=X, y=Y)
+## Predict
+Y_pred = model_ols.predict(X)
+## Score model
+score = model_ols.score(X=X, y=Y)
+print(f"R^2: {score}")
 ```
