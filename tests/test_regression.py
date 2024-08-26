@@ -6,7 +6,7 @@ import numpy as np
 from hypothesis import given, strategies as st
 import hypothesis
 
-from ..torch_linear_regression import OLS
+from torch_linear_regression import OLS
 
 # Basic functionality and accuracy
 def test_basic_functionality():
