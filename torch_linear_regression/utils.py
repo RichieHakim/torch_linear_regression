@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-def check_full_rank(X, a_thresh=None, r_thresh=None):
+def check_full_rank(X, a_thresh=None, r_thresh=1e-10):
     """
     Check if a matrix is full rank.
 
@@ -20,7 +20,7 @@ def check_full_rank(X, a_thresh=None, r_thresh=None):
 
     Returns:
         bool: 
-            True if the matrix is rank-deficient, False otherwise.
+            True if the matrix is full rank, False otherwise.
     """
     U, S, V = torch.linalg.svd(torch.as_tensor(X))
 
@@ -30,5 +30,4 @@ def check_full_rank(X, a_thresh=None, r_thresh=None):
     if r_thresh is not None:
         S_bool = S_bool & (S > r_thresh * S[0])
 
-    return not torch.all(S_bool)
-    
+    return S_bool.all()
