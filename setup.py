@@ -50,6 +50,6 @@ setup(
 
     packages=['torch_linear_regression'],
 
-    install_requires=[],
+    install_requires=deps_all,
     # extras_require=extras_require,
 )
