@@ -10,16 +10,20 @@ Includes:
 - Reduced Rank Regression (RRR) with Ridge penalty: Ridge regression followed by SVD on the weights matrix
 
 The closed-form approach results in fast and accurate results under most
-conditions. However, when ``n_features`` is large and/or underdetermined
-(``n_samples`` <= ``n_features``), the solution will start to diverge from
-gradient-based / sklearn solutions.
+conditions. However, when ``n_features`` is large and/or very underdetermined
+(``n_samples`` << ``n_features``), the closed-form solution will start to
+diverge from other solutions. Also, if the input `X` matrix is singular (has
+redundant columns), an error will be thrown. If you encounter these issues,
+either consider using SVD / PCA to reduce the redundancy in your input matrix,
+or just let me know and I will implement the least squares solution for these
+edge cases.
 
 Each model also includes a `model.prefit()` method that can be used to precompute
 the inverse matrix and the ridge penalty matrix. This can be useful when the model
 is used multiple times with the same `X` input data.
 
 Because the models are based on PyTorch, they are significantly faster than sklearn's
-models, and can be further accelerated by using GPU. Also the models can be used
+models, and can be further accelerated by using a GPU. Also the models can be used
 in conjunction with PyTorch's autograd for gradient-based optimization.
 
 ## Installation
