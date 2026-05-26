@@ -1,13 +1,13 @@
 """
 Ridge regression with marginal maximum likelihood (MML) lambda selection.
 
-Port of ridgeMML.m (Matt Kaufman, 2018) -- Karabatsos 2017 algorithm.
-PyTorch backend for SVD, NLL sweep, and beta solve.
-Vectorized golden-section search replaces scipy Brent refinement.
+Karabatsos 2017 algorithm with PyTorch acceleration for SVD, vectorized NLL
+sweep, batched beta solve, and vectorized golden-section refinement.
 
 X columns are intrinsically z-scored (divide by std, mean-center) before
-regression. Coefficients are un-z-scored before being stored, so
-``predict(X_raw)`` works on raw (non-z-scored) data.
+regression -- this is required for lambda comparability across features.
+Coefficients are un-z-scored before storage, so ``predict(X_raw)`` works
+on raw data.
 
 Reference:
     Karabatsos, G. (2017). Marginal maximum likelihood estimation methods for
@@ -26,15 +26,18 @@ import torch
 from .linear_regression import LinearRegression_sk
 
 
+## Floor for clamping values before log() to avoid log(0) or log(negative).
+_LOG_CLAMP_MIN = 1e-300
+
+
 ###############################################################################
-## Module-level helpers (private)
+## Helpers
 ###############################################################################
 
 
 def _select_device(device: Optional[Union[str, torch.device]] = None) -> torch.device:
     """
-    Resolve device string to ``torch.device``. If ``None``, auto-detect
-    cuda / cpu.
+    Resolve device string to ``torch.device``. ``None`` auto-detects cuda/cpu.
 
     Args:
         device (Optional[Union[str, torch.device]]):
@@ -45,10 +48,7 @@ def _select_device(device: Optional[Union[str, torch.device]] = None) -> torch.d
             Resolved device.
     """
     if device is None:
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        else:
-            return torch.device("cpu")
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
 
 
@@ -61,9 +61,9 @@ def _nll_batch(
     q: int,
 ) -> torch.Tensor:
     """
-    Batched negative log-likelihood (Eq. 19 of Karabatsos 2017).
+    Batched NLL (Eq. 19 of Karabatsos 2017) for per-column lambda values.
 
-    Evaluates the NLL at per-column lambda values ``L``.
+    ``NLL(L) = -(q*log(L) - sum_j(log(L + d_j^2)) - n*log(Y_var - sum_j(alpha_j^2 / (L + d_j^2))))``
 
     Args:
         L (torch.Tensor):
@@ -83,30 +83,74 @@ def _nll_batch(
         (torch.Tensor):
             NLL values, shape ``(p_y,)``. Invalid entries are ``inf``.
     """
-    ## Ld2: (q, p_y) -- broadcast d2 (q,) with L (p_y,)
+    ## Broadcast: d2 (q,1) + L (1,p_y) -> Ld2 (q, p_y)
     Ld2 = L[None, :] + d2[:, None]  ## (q, p_y)
-
-    ## ratio_sum: sum over q of alpha2 / Ld2 -> (p_y,)
-    ratio_sum = torch.sum(alpha2 / Ld2, dim=0)  ## (p_y,)
-
-    ## inner = Y_var - ratio_sum; clamp before log to avoid log(negative)
-    inner = Y_var - ratio_sum  ## (p_y,)
-    inner_safe = inner.clamp(min=1e-300)  ## (p_y,)
-
-    ## log(Ld2) summed over q -> (p_y,)
+    ratio_sum = torch.sum(alpha2 / Ld2, dim=0)  ## (p_y,) -- sum over singular values
+    inner = Y_var - ratio_sum  ## (p_y,) -- argument of the outer log
     log_Ld2_sum = torch.sum(torch.log(Ld2), dim=0)  ## (p_y,)
 
-    ## L must be > 0 for log(L) to be valid; clamp for safety
-    L_safe = L.clamp(min=1e-300)  ## (p_y,)
+    ## Clamp before log to avoid NaN from log(<=0)
+    nll = -(
+        q * torch.log(L.clamp(min=_LOG_CLAMP_MIN))
+        - log_Ld2_sum
+        - n * torch.log(inner.clamp(min=_LOG_CLAMP_MIN))
+    )  ## (p_y,)
 
-    ## NLL = -(q*log(L) - sum(log(L+d2)) - n*log(inner))
-    nll = -(q * torch.log(L_safe) - log_Ld2_sum - n * torch.log(inner_safe))  ## (p_y,)
+    ## Mask entries where the NLL is undefined
+    valid = (inner > 0) & (L > 0)  ## (p_y,)
+    return torch.where(valid, nll, torch.inf)
 
-    ## Mask invalid entries: inner <= 0 or L <= 0
-    inf_tensor = torch.tensor(float("inf"), dtype=nll.dtype, device=nll.device)
-    nll = torch.where((inner > 0) & (L > 0), nll, inf_tensor)  ## (p_y,)
 
-    return nll
+def _nll_scalar_broadcast(
+    L_val: float,
+    d2: torch.Tensor,
+    alpha2: torch.Tensor,
+    n: int,
+    q: int,
+    Y_var: torch.Tensor,
+) -> torch.Tensor:
+    """
+    NLL for a single scalar lambda broadcast across all ``p_y`` columns.
+
+    Same math as ``_nll_batch`` but exploits the fact that ``log(L + d_j^2)``
+    is shared across columns, making it O(q) instead of O(q * p_y) for that
+    term.
+
+    Args:
+        L_val (float):
+            Lambda value (scalar, same for all columns).
+        d2 (torch.Tensor):
+            Squared singular values. Shape: ``(q,)``.
+        alpha2 (torch.Tensor):
+            Squared alpha values. Shape: ``(q, p_y)``.
+        n (int):
+            Number of observations.
+        q (int):
+            Number of valid singular values.
+        Y_var (torch.Tensor):
+            Column-wise sum of squared Y. Shape: ``(p_y,)``.
+
+    Returns:
+        (torch.Tensor):
+            NLL values, shape ``(p_y,)``. Invalid entries are ``inf``.
+    """
+    if L_val <= 0:
+        return torch.full_like(Y_var, float("inf"))
+
+    ## Because L is scalar, Ld2 is (q,) shared across all columns.
+    ## This makes log_Ld2_sum a scalar rather than (p_y,) -- O(q) not O(q*p_y).
+    Ld2 = L_val + d2  ## (q,)
+    ratio_sum = torch.sum(alpha2 / Ld2[:, None], dim=0)  ## (q,p_y) / (q,1) -> sum -> (p_y,)
+    inner = Y_var - ratio_sum  ## (p_y,)
+    log_Ld2_sum = torch.sum(torch.log(Ld2))  ## scalar (shared across all columns)
+
+    nll = -(
+        q * math.log(L_val)
+        - log_Ld2_sum
+        - n * torch.log(inner.clamp(min=_LOG_CLAMP_MIN))
+    )  ## (p_y,)
+
+    return torch.where(inner > 0, nll, torch.inf)
 
 
 def _vectorized_nll_sweep(
@@ -115,16 +159,16 @@ def _vectorized_nll_sweep(
     alpha2: torch.Tensor,
     n: int,
     Y_var: torch.Tensor,
-    p_y: int,
-    device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Vectorized two-phase NLL sweep over all ``p_y`` columns simultaneously.
+    Two-phase NLL sweep over all ``p_y`` columns simultaneously.
 
-    Phase 1: step size 1/4 for lambda in ``[0, step_switch]``.
-    Phase 2: adaptive step size ``(L / step_denom)`` with boxcar(7) smoothing.
+    Phase 1: fixed step of ``1 / STEPS_PER_UNIT`` for lambda in
+    ``[0, PHASE1_LIMIT]``.
+    Phase 2: adaptive step ``L * (1 + 1/ADAPTIVE_DENOM)`` with boxcar
+    smoothing of width ``SMOOTH_KERNEL``.
 
-    Returns per-column ``(min_L, max_L)`` bounds for golden-section refinement.
+    Returns per-column bracket bounds for golden-section refinement.
 
     Args:
         q (int):
@@ -137,147 +181,119 @@ def _vectorized_nll_sweep(
             Number of observations.
         Y_var (torch.Tensor):
             Sum of squared Y column values. Shape: ``(p_y,)``.
-        p_y (int):
-            Number of Y columns.
-        device (torch.device):
-            Computation device.
 
     Returns:
         (Tuple[torch.Tensor, torch.Tensor]):
             bounds (torch.Tensor):
                 Shape ``(p_y, 2)``. Column 0 = min_L, column 1 = max_L.
             hit_cap (torch.Tensor):
-                Boolean tensor, shape ``(p_y,)``. True if the lambda cap was
-                hit during the sweep (convergence failure).
+                Boolean, shape ``(p_y,)``. True if the cap was hit
+                (convergence failure).
     """
-    ## Constants -- matching MATLAB exactly
-    smooth = 7
-    step_switch = 25
-    step_denom = 100
-    max_lambda_cap = 1e8
+    ## Algorithm constants (Karabatsos 2017, Sec. 3.1)
+    SMOOTH_KERNEL = 7        ## boxcar smoothing width for phase-2 NLL
+    PHASE1_LIMIT = 25        ## phase 1 scans lambda in [0, PHASE1_LIMIT]
+    STEPS_PER_UNIT = 4       ## phase 1 step size = 1 / STEPS_PER_UNIT = 0.25
+    ADAPTIVE_DENOM = 100     ## phase 2 growth: L_{k+1} = L_k * (1 + 1/ADAPTIVE_DENOM)
+    LAMBDA_CAP = 1e8         ## safety cap for flat NLL landscapes
 
-    ## Pre-allocate scalar constants outside loop
-    _dtype = torch.float64
-    inf_val = torch.tensor(float("inf"), dtype=_dtype, device=device)
+    p_y = alpha2.shape[1]
+    device = d2.device
 
     ## Output buffers
-    min_L = torch.zeros(p_y, dtype=_dtype, device=device)
-    max_L = torch.zeros(p_y, dtype=_dtype, device=device)
+    min_L = torch.zeros(p_y, dtype=torch.float64, device=device)
+    max_L = torch.zeros(p_y, dtype=torch.float64, device=device)
     done_mask = torch.zeros(p_y, dtype=torch.bool, device=device)
     hit_cap = torch.zeros(p_y, dtype=torch.bool, device=device)
 
-    ## Rolling smoothing buffer: (smooth, p_y)
-    sm_buffer = torch.full((smooth, p_y), float("nan"), dtype=_dtype, device=device)
-    test_vals_L = torch.full((smooth, p_y), float("nan"), dtype=_dtype, device=device)
-    sm_buffer_i = -1  ## will be incremented before use
+    ## Rolling smoothing buffer: (SMOOTH_KERNEL, p_y)
+    sm_buffer = torch.full((SMOOTH_KERNEL, p_y), float("nan"), dtype=torch.float64, device=device)
+    test_vals_L = torch.full((SMOOTH_KERNEL, p_y), float("nan"), dtype=torch.float64, device=device)
+    sm_idx = -1
 
-    ## Vectorized NLL computation helper (scalar L, broadcast across p_y)
-    def _compute_nll_scalar(L_val: float) -> torch.Tensor:
-        """Compute NLL for scalar L across all p_y columns. Returns (p_y,)."""
-        if L_val <= 0:
-            return torch.full((p_y,), float("inf"), dtype=_dtype, device=device)
-        Ld2 = L_val + d2  ## (q,)
-        ## sum(alpha2 / Ld2) over q dimension: (q, p_y) / (q, 1) -> sum -> (p_y,)
-        ratio_sum = torch.sum(alpha2 / Ld2[:, None], dim=0)  ## (p_y,)
-        inner = Y_var - ratio_sum  ## (p_y,)
-        inner_safe = inner.clamp(min=1e-300)  ## (p_y,)
-        log_Ld2_sum = torch.sum(torch.log(Ld2))  ## scalar (same for all columns)
+    ## Phase 1: fixed-step sweep
+    prev_NLL = torch.full((p_y,), float("inf"), dtype=torch.float64, device=device)
+    n_phase1_steps = int(PHASE1_LIMIT * STEPS_PER_UNIT) + 1
 
-        nll = -(q * math.log(L_val) - log_Ld2_sum - n * torch.log(inner_safe))  ## (p_y,)
-        ## Mask invalid entries
-        nll = torch.where(inner > 0, nll, inf_val)  ## (p_y,)
-        return nll
+    for k in range(n_phase1_steps):
+        sm_idx = (sm_idx + 1) % SMOOTH_KERNEL
+        L_val = k / STEPS_PER_UNIT
 
-    ## Phase 1: step size 1/4, lambda from 0 to stepSwitch
-    prev_NLL = torch.full((p_y,), float("inf"), dtype=_dtype, device=device)
+        NLL = _nll_scalar_broadcast(L_val=L_val, d2=d2, alpha2=alpha2, n=n, q=q, Y_var=Y_var)  ## (p_y,)
 
-    for k in range(int(step_switch * 4) + 1):
-        sm_buffer_i = (sm_buffer_i + 1) % smooth
-        L_val = k / 4.0
+        sm_buffer[sm_idx, :] = NLL
+        test_vals_L[sm_idx, :] = L_val
 
-        NLL = _compute_nll_scalar(L_val)  ## (p_y,)
-
-        ## Store in rolling buffer
-        sm_buffer[sm_buffer_i, :] = NLL
-        test_vals_L[sm_buffer_i, :] = L_val
-
-        ## Check which columns just passed their minimum (NLL > prev_NLL and not yet done)
+        ## Detect columns whose NLL just increased (passed through minimum).
+        ## The bracket is [k-2, k] in step units -- one step before and after
+        ## the minimum, giving golden-section a tight interval to refine.
         just_passed = (NLL > prev_NLL) & (~done_mask)
         if just_passed.any():
-            val_min = torch.tensor((k - 2) / 4.0, dtype=_dtype, device=device)
-            val_max = torch.tensor(k / 4.0, dtype=_dtype, device=device)
-            min_L = torch.where(just_passed, val_min, min_L)
-            max_L = torch.where(just_passed, val_max, max_L)
+            bracket_lo = (k - 2) / STEPS_PER_UNIT
+            bracket_hi = k / STEPS_PER_UNIT
+            min_L = torch.where(just_passed, bracket_lo, min_L)
+            max_L = torch.where(just_passed, bracket_hi, max_L)
             done_mask = done_mask | just_passed
 
+        ## Freeze prev_NLL for done columns so future comparisons don't trigger
         prev_NLL = torch.where(done_mask, prev_NLL, NLL)
 
         if done_mask.all():
             break
 
-    ## Phase 2: adaptive step with smoothing for columns not yet done
+    ## Phase 2: adaptive step with boxcar smoothing.
+    ## Step size grows geometrically: L_{k+1} = L_k * (1 + 1/ADAPTIVE_DENOM).
+    ## NLL is smoothed with a rolling boxcar mean to handle noisy landscapes.
     if not done_mask.all():
-        L_current = k / 4.0  ## last k from phase 1
+        L_current = (n_phase1_steps - 1) / STEPS_PER_UNIT
 
-        ## Reset prev_NLL for undone columns to the buffer mean
-        prev_NLL_phase2 = torch.nanmean(sm_buffer, dim=0)  ## (p_y,)
-        prev_NLL = torch.where(done_mask, prev_NLL, prev_NLL_phase2)
+        ## Switch from raw NLL to smoothed NLL as the comparison baseline
+        prev_NLL = torch.where(done_mask, prev_NLL, torch.nanmean(sm_buffer, dim=0))
 
         while not done_mask.all():
-            L_current = L_current + L_current / step_denom
-            sm_buffer_i = (sm_buffer_i + 1) % smooth
+            L_current = L_current + L_current / ADAPTIVE_DENOM
+            sm_idx = (sm_idx + 1) % SMOOTH_KERNEL
 
-            NLL_new = _compute_nll_scalar(L_current)  ## (p_y,)
+            NLL_new = _nll_scalar_broadcast(L_val=L_current, d2=d2, alpha2=alpha2, n=n, q=q, Y_var=Y_var)
 
             ## Update buffer only for undone columns
-            sm_buffer[sm_buffer_i, :] = torch.where(
-                done_mask, sm_buffer[sm_buffer_i, :], NLL_new,
-            )
-            L_current_tensor = torch.tensor(L_current, dtype=_dtype, device=device)
-            test_vals_L[sm_buffer_i, :] = torch.where(
-                done_mask, test_vals_L[sm_buffer_i, :], L_current_tensor,
-            )
+            sm_buffer[sm_idx, :] = torch.where(done_mask, sm_buffer[sm_idx, :], NLL_new)
+            test_vals_L[sm_idx, :] = torch.where(done_mask, test_vals_L[sm_idx, :], L_current)
 
-            ## Smoothed NLL for undone columns
             NLL_smooth = torch.nanmean(sm_buffer, dim=0)  ## (p_y,)
 
-            ## Check which undone columns passed minimum
+            ## Detect columns that passed minimum in the smoothed signal
             just_passed = (NLL_smooth > prev_NLL) & (~done_mask)
             if just_passed.any():
-                ## Walk back by half kernel: (smooth-1)/2 = 3 steps back from current
-                walk_back = (smooth - 1) // 2  ## = 3
-                idx_max = (sm_buffer_i - walk_back) % smooth
-                idx_min = (idx_max - 2) % smooth
-
-                ## Extract max_L and min_L from the buffer for these columns
-                max_L = torch.where(just_passed, test_vals_L[idx_max, :], max_L)
-                min_L = torch.where(just_passed, test_vals_L[idx_min, :], min_L)
+                ## Walk back by half the kernel width to bracket the true minimum.
+                ## The smoothed minimum lags the raw minimum by ~half_kernel steps.
+                ## idx_hi/idx_lo give a 2-step-wide bracket centered on the estimate.
+                half_kernel = (SMOOTH_KERNEL - 1) // 2  ## = 3 for kernel width 7
+                idx_hi = (sm_idx - half_kernel) % SMOOTH_KERNEL
+                idx_lo = (idx_hi - 2) % SMOOTH_KERNEL
+                max_L = torch.where(just_passed, test_vals_L[idx_hi, :], max_L)
+                min_L = torch.where(just_passed, test_vals_L[idx_lo, :], min_L)
                 done_mask = done_mask | just_passed
 
-            ## Update prev_NLL for undone columns
             prev_NLL = torch.where(done_mask, prev_NLL, NLL_smooth)
 
-            ## Safety cap
-            if L_current > max_lambda_cap:
+            ## Safety cap for flat NLL landscapes
+            if L_current > LAMBDA_CAP:
                 still_undone = ~done_mask
                 if still_undone.any():
                     warnings.warn(
-                        f"RidgeMML lambda search hit cap (L={L_current:.2e} > "
-                        f"{max_lambda_cap:.2e}). NLL landscape is flat -- using "
+                        f"RidgeMML lambda search hit cap ({L_current:.2e} > "
+                        f"{LAMBDA_CAP:.2e}). NLL landscape is flat -- using "
                         f"cap as upper bound for {still_undone.sum().item()} "
                         f"columns.",
                         stacklevel=3,
                     )
-                    val_min_cap = torch.tensor(max_lambda_cap / 2.0, dtype=_dtype, device=device)
-                    val_max_cap = torch.tensor(max_lambda_cap, dtype=_dtype, device=device)
-                    min_L = torch.where(still_undone, val_min_cap, min_L)
-                    max_L = torch.where(still_undone, val_max_cap, max_L)
+                    min_L = torch.where(still_undone, LAMBDA_CAP / 2.0, min_L)
+                    max_L = torch.where(still_undone, LAMBDA_CAP, max_L)
                     hit_cap = hit_cap | still_undone
-                    done_mask = torch.ones(p_y, dtype=torch.bool, device=device)
+                    done_mask = torch.ones_like(done_mask)
 
-    ## Pack bounds as (p_y, 2) tensor
     bounds = torch.stack([min_L, max_L], dim=1)  ## (p_y, 2)
-
     return bounds, hit_cap
 
 
@@ -289,14 +305,14 @@ def _vectorized_golden_section(
     q: int,
     bounds: torch.Tensor,
     xatol: float = 1e-4,
-    max_iter: int = 200,
+    max_iter: int = 60,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Vectorized golden-section search for the NLL minimum over all ``p_y``
+    Vectorized golden-section search for the NLL minimum across all ``p_y``
     columns simultaneously.
 
-    One NLL evaluation per iteration (reuses the other point from the previous
-    iteration). Replaces the sequential scipy Brent loop.
+    One NLL evaluation per iteration (the other interior point is reused
+    from the previous iteration).
 
     Args:
         d2 (torch.Tensor):
@@ -310,11 +326,12 @@ def _vectorized_golden_section(
         q (int):
             Number of valid singular values.
         bounds (torch.Tensor):
-            Per-column ``(min_L, max_L)`` from the sweep. Shape: ``(p_y, 2)``.
+            Per-column ``[min_L, max_L]`` from the sweep. Shape: ``(p_y, 2)``.
         xatol (float):
             Absolute tolerance on the bracket width.
         max_iter (int):
-            Maximum number of iterations.
+            Maximum iterations. 60 covers all practical bracket widths to
+            ``xatol=1e-4``: ``ceil(log(1e-4 / 5e7) / log(0.618)) ~ 56``.
 
     Returns:
         (Tuple[torch.Tensor, torch.Tensor]):
@@ -324,78 +341,55 @@ def _vectorized_golden_section(
                 Boolean, shape ``(p_y,)``. True where the bracket width
                 exceeds ``xatol`` after ``max_iter`` iterations.
     """
-    ## Golden ratio constants
-    inv_phi = (math.sqrt(5.0) - 1.0) / 2.0   ## ~0.6180
-    inv_phi2 = 1.0 - inv_phi                  ## ~0.3820
+    ## Golden ratio conjugate and its complement
+    INV_PHI = (math.sqrt(5.0) - 1.0) / 2.0   ## ~0.6180
+    INV_PHI2 = 1.0 - INV_PHI                  ## ~0.3820
 
-    _dtype = bounds.dtype
-    _device = bounds.device
-    p_y = bounds.shape[0]
-
-    ## Clamp lower bounds to >= 0
+    ## Initialize bracket endpoints
     a = bounds[:, 0].clamp(min=0.0)  ## (p_y,)
     b = bounds[:, 1].clone()         ## (p_y,)
 
-    ## Initial interior points
-    c = a + inv_phi2 * (b - a)  ## (p_y,)
-    d = a + inv_phi * (b - a)   ## (p_y,)
-
-    ## Evaluate NLL at both interior points (2 evals for init)
+    ## Initial interior points (2 evals to bootstrap)
+    c = a + INV_PHI2 * (b - a)  ## (p_y,)
+    d = a + INV_PHI * (b - a)   ## (p_y,)
     fc = _nll_batch(L=c, d2=d2, alpha2=alpha2, n=n, Y_var=Y_var, q=q)  ## (p_y,)
     fd = _nll_batch(L=d, d2=d2, alpha2=alpha2, n=n, Y_var=Y_var, q=q)  ## (p_y,)
 
     for _ in range(max_iter):
-        ## Check convergence
-        width = b - a  ## (p_y,)
-        if (width < xatol).all():
+        if ((b - a) < xatol).all():
             break
 
-        ## Branch mask: True where fc < fd (shrink right), False (shrink left)
-        branch_left = fc < fd  ## (p_y,)
+        ## Per-column branch: shrink_right where fc < fd, else shrink_left
+        shrink_right = fc < fd  ## (p_y,)
 
-        ## Update brackets
-        ## branch_left:  b <- d, d <- c, fd <- fc, new c, eval fc
-        ## branch_right: a <- c, c <- d, fc <- fd, new d, eval fd
-        a_new = torch.where(branch_left, a, c)   ## (p_y,)
-        b_new = torch.where(branch_left, d, b)   ## (p_y,)
+        ## Update bracket endpoints
+        a_new = torch.where(shrink_right, a, c)  ## (p_y,)
+        b_new = torch.where(shrink_right, d, b)  ## (p_y,)
 
-        ## After updating a,b: the kept interior point.
-        ## Both branches select the same source value (old c or old d),
-        ## but they serve distinct semantic roles: c_kept becomes the new d
-        ## for branch_left columns, and d_kept becomes the new c for
-        ## branch_right columns. Separated for clarity at assembly below.
-        c_kept = torch.where(branch_left, c, d)   ## interior point that stays
-        fc_kept = torch.where(branch_left, fc, fd)
+        ## The interior point that survives (reused, not re-evaluated)
+        kept = torch.where(shrink_right, c, d)      ## (p_y,)
+        f_kept = torch.where(shrink_right, fc, fd)   ## (p_y,)
 
-        d_kept = torch.where(branch_left, c, d)   ## same value, distinct role per branch
-        fd_kept = torch.where(branch_left, fc, fd)
+        ## The single new point to evaluate
+        ## shrink_right: new c at INV_PHI2 position; shrink_left: new d at INV_PHI position
+        new_point = torch.where(
+            shrink_right,
+            a_new + INV_PHI2 * (b_new - a_new),
+            a_new + INV_PHI * (b_new - a_new),
+        )  ## (p_y,)
+        f_new = _nll_batch(L=new_point, d2=d2, alpha2=alpha2, n=n, Y_var=Y_var, q=q)
 
-        ## Compute the single new eval point per column
-        ## branch_left:  new c = a_new + inv_phi2 * (b_new - a_new)
-        ## branch_right: new d = a_new + inv_phi  * (b_new - a_new)
-        new_c_candidate = a_new + inv_phi2 * (b_new - a_new)  ## (p_y,)
-        new_d_candidate = a_new + inv_phi * (b_new - a_new)   ## (p_y,)
-
-        ## The point to evaluate: for branch_left it's new_c, for branch_right it's new_d
-        eval_point = torch.where(branch_left, new_c_candidate, new_d_candidate)  ## (p_y,)
-
-        ## Single batched NLL evaluation
-        f_eval = _nll_batch(L=eval_point, d2=d2, alpha2=alpha2, n=n, Y_var=Y_var, q=q)  ## (p_y,)
-
-        ## Assemble new state
-        ## branch_left:  c=new_c_candidate, fc=f_eval, d=old_c, fd=old_fc
-        ## branch_right: c=old_d, fc=old_fd, d=new_d_candidate, fd=f_eval
+        ## Reassemble state
+        ## shrink_right: c=new_point, fc=f_new, d=kept(old c), fd=f_kept(old fc)
+        ## shrink_left:  c=kept(old d), fc=f_kept(old fd), d=new_point, fd=f_new
         a = a_new
         b = b_new
-        c = torch.where(branch_left, new_c_candidate, d_kept)
-        fc = torch.where(branch_left, f_eval, fd_kept)
-        d = torch.where(branch_left, c_kept, new_d_candidate)
-        fd = torch.where(branch_left, fc_kept, f_eval)
+        c = torch.where(shrink_right, new_point, kept)
+        fc = torch.where(shrink_right, f_new, f_kept)
+        d = torch.where(shrink_right, kept, new_point)
+        fd = torch.where(shrink_right, f_kept, f_new)
 
-    ## Optimal lambda: midpoint of final bracket
     lambdas_opt = (a + b) / 2.0  ## (p_y,)
-
-    ## Convergence check
     did_not_converge = (b - a) >= xatol  ## (p_y,)
 
     return lambdas_opt, did_not_converge
@@ -409,8 +403,7 @@ def _batched_solve(
     batch_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Solve ``(XTX + lambda_i * ep) @ beta_i = XTY[:, i]`` for all columns
-    simultaneously.
+    Solve ``(XTX + lambda_i * ep) @ beta_i = XTY[:, i]`` for all columns.
 
     Batches the leading dimension (p_y) to control memory usage.
 
@@ -424,7 +417,7 @@ def _batched_solve(
         XTY (torch.Tensor):
             ``X^T Y`` matrix. Shape: ``(p, p_y)``.
         batch_size (Optional[int]):
-            Number of columns to solve at once. ``None`` means all.
+            Columns to solve at once. ``None`` means all.
 
     Returns:
         (torch.Tensor):
@@ -441,22 +434,18 @@ def _batched_solve(
     for start in range(0, p_y, batch_size):
         end = min(start + batch_size, p_y)
 
-        ## Build batch of (XTX + lambda_i * ep) matrices
-        ## A shape: (bs, p, p)
-        A = XTX[None, :, :] + lambdas[start:end, None, None] * ep[None, :, :]
-
-        ## RHS: (bs, p, 1) -> solve -> (bs, p, 1) -> squeeze
+        ## Broadcast: XTX (1,p,p) + lambdas (bs,1,1) * I (1,p,p) -> A (bs,p,p)
+        A = XTX[None, :, :] + lambdas[start:end, None, None] * ep[None, :, :]  ## (bs, p, p)
+        ## Reshape XTY columns to (bs, p, 1) for batched solve
         rhs = XTY[:, start:end].T[:, :, None]  ## (bs, p, 1)
-
-        ## torch.linalg.solve: A @ x = rhs
         x = torch.linalg.solve(A, rhs)  ## (bs, p, 1)
-        betas[:, start:end] = x[..., 0].T  ## (p, bs)
+        betas[:, start:end] = x[..., 0].T  ## drop last dim and transpose back to (p, bs)
 
     return betas
 
 
 ###############################################################################
-## RidgeMML class
+## RidgeMML
 ###############################################################################
 
 
@@ -465,27 +454,27 @@ class RidgeMML(LinearRegression_sk):
     Ridge regression with per-column marginal maximum likelihood lambda
     estimation (Karabatsos 2017).
 
-    X columns are intrinsically z-scored (divided by ``std(ddof=1)``,
-    mean-centered) before regression. Coefficients are un-z-scored before
-    being stored, so ``predict(X_raw)`` works on raw data.
+    Key differences from ``Ridge``:
 
-    The intercept is derived as ``Y_mean - X_mean_raw @ coef_`` after
-    computing betas on centered data.
+    - **Per-column lambda.** Each column of Y gets its own regularization
+      parameter, estimated via marginal maximum likelihood.
+    - **Intrinsic z-scoring.** X columns are always standardized internally
+      (divided by ``std(ddof=1)``, mean-centered). This is required by the
+      algorithm for lambda comparability. Coefficients are un-z-scored
+      before storage, so ``predict(X_raw)`` works on raw data.
 
     RH 2025
 
     Args:
         fit_intercept (bool):
-            Must be ``True``. ``False`` raises ``NotImplementedError`` at
-            fit time.
+            Must be ``True``. ``False`` raises ``NotImplementedError``.
         lambdas (Optional[np.ndarray]):
             Pre-supplied per-column ridge parameters, shape ``(p_y,)``.
             If ``None`` (default), lambdas are estimated via MML.
         device (Optional[Union[str, torch.device]]):
-            Torch device for computation. ``None`` means auto-detect
-            (cuda if available, else cpu).
+            Torch device for computation. ``None`` auto-detects cuda/cpu.
         batch_size_solve (Optional[int]):
-            Number of Y columns to solve simultaneously in the beta solve.
+            Y columns to solve simultaneously in the beta solve.
             ``None`` (default) means all at once. Reduce for large ``p_y``
             to limit GPU memory.
 
@@ -541,9 +530,8 @@ class RidgeMML(LinearRegression_sk):
         Args:
             X (Union[np.ndarray, torch.Tensor]):
                 Design matrix (no intercept column). Shape: ``(n, p_x)``.
-                Must be 2-D.
             y (Union[np.ndarray, torch.Tensor]):
-                Outcome matrix. Shape: ``(n, p_y)``. Must be 2-D.
+                Outcome matrix. Shape: ``(n, p_y)`` or ``(n,)``.
 
         Returns:
             (RidgeMML):
@@ -555,22 +543,16 @@ class RidgeMML(LinearRegression_sk):
             ValueError:
                 If shapes are incompatible or inputs are not 2-D.
         """
-        ## -----------------------------------------------------------
-        ## Guard: fit_intercept=False not supported
-        ## -----------------------------------------------------------
         if not self.fit_intercept:
             raise NotImplementedError(
-                "RidgeMML only supports fit_intercept=True. "
-                "The no-intercept path is not implemented."
+                "RidgeMML requires fit_intercept=True. The MML algorithm "
+                "intrinsically mean-centers the data."
             )
 
-        ## -----------------------------------------------------------
-        ## Input validation
-        ## -----------------------------------------------------------
+        ## Input validation and conversion to numpy float64
         input_is_torch = isinstance(X, torch.Tensor)
         input_device = X.device if input_is_torch else None
 
-        ## Convert to numpy float64 for preprocessing
         if input_is_torch:
             X_np = X.detach().cpu().numpy().astype(np.float64)
             y_np = y.detach().cpu().numpy().astype(np.float64)
@@ -590,166 +572,117 @@ class RidgeMML(LinearRegression_sk):
                 f"y has {y_np.shape[0]} rows"
             )
 
-        n = X_np.shape[0]
-        p_x = X_np.shape[1]
+        n, p_x = X_np.shape
         p_y = y_np.shape[1]
         self.n_features_in_ = p_x
-
         dev = _select_device(self.device)
 
-        ## -----------------------------------------------------------
-        ## Store raw X column means (before any transformation)
-        ## -----------------------------------------------------------
-        X_mean_raw = X_np.mean(axis=0)  ## (p_x,)
-
-        ## -----------------------------------------------------------
-        ## Mean-center Y
-        ## -----------------------------------------------------------
+        ## Preprocessing: mean-center Y, z-score and mean-center X.
+        ## Z-scoring uses ddof=1 (sample std) for consistency with the original algorithm.
+        ## Constant columns get std=1 to avoid division by zero.
+        X_mean_raw = X_np.mean(axis=0)  ## (p_x,) -- saved for intercept derivation
         Y_mean = y_np.mean(axis=0)  ## (p_y,)
         Y_centered = y_np - Y_mean[None, :]  ## (n, p_y)
 
-        ## -----------------------------------------------------------
-        ## Z-score X: divide by std(ddof=1), then mean-center
-        ## -----------------------------------------------------------
         X_std = np.std(X_np, axis=0, ddof=1)  ## (p_x,)
-        X_std[X_std == 0] = 1.0  ## prevent division by zero
+        X_std[X_std == 0] = 1.0
         X_zscored = X_np / X_std[None, :]  ## (n, p_x)
+        X_centered = X_zscored - X_zscored.mean(axis=0)[None, :]  ## (n, p_x)
 
-        X_mean_zscored = X_zscored.mean(axis=0)  ## (p_x,)
-        X_centered = X_zscored - X_mean_zscored[None, :]  ## (n, p_x)
-
-        ## -----------------------------------------------------------
-        ## Determine whether to compute lambdas
-        ## -----------------------------------------------------------
+        ## Resolve lambdas: pre-supplied, single-regressor shortcut, or MML
         compute_lambdas = True
         lambdas_precomputed = None
+
         if self.lambdas is not None:
             lambdas_precomputed = np.asarray(self.lambdas, dtype=np.float64)
             if not np.isnan(lambdas_precomputed[0]):
                 compute_lambdas = False
+                if len(lambdas_precomputed) != p_y:
+                    raise ValueError(
+                        f"lambdas has length {len(lambdas_precomputed)}, "
+                        f"expected {p_y} (number of y columns)"
+                    )
 
-        ## Validate pre-supplied lambdas shape
-        if lambdas_precomputed is not None and not np.isnan(lambdas_precomputed[0]):
-            if len(lambdas_precomputed) != p_y:
-                raise ValueError(
-                    f"lambdas has length {len(lambdas_precomputed)}, "
-                    f"expected {p_y} (number of y columns)"
-                )
-
-        ## Single-regressor edge case: skip optimization, set lambda=1
         if p_x == 1 and compute_lambdas:
             compute_lambdas = False
             lambdas_precomputed = np.ones(p_y)
 
-        ## -----------------------------------------------------------
-        ## Lambda optimization
-        ## -----------------------------------------------------------
+        ## Lambda optimization via MML
         convergence_failures = np.zeros(p_y, dtype=bool)
 
         if compute_lambdas:
-            ## Move to torch for SVD and NLL sweep
             X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
             Y_t = torch.as_tensor(Y_centered, dtype=torch.float64, device=dev)
 
-            ## SVD of X_centered
-            U_t, s_t, Vh_t = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,), Vh:(p,p)
+            ## SVD of centered, z-scored X
+            U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,)
 
-            ## Number of valid singular values (MATLAB line 131)
-            eps_u1_np = np.spacing(U_t[0, 0].cpu().item())
-            threshold_t = eps_u1_np * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
+            ## Count numerically valid singular values.
+            ## Threshold scales with index: s_j must exceed eps(U[0,0]) * j.
+            ## This discards singular values that are indistinguishable from
+            ## roundoff in U, preventing them from dominating the NLL.
+            eps_u1 = np.spacing(U_t[0, 0].cpu().item())
+            threshold_t = eps_u1 * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
             q = int((s_t > threshold_t).sum().item())
 
             d2_t = s_t ** 2  ## (p,)
-
-            ## alpha = S * U' * Y (MATLAB line 139)
-            alph_t = s_t[:, None] * (U_t.T @ Y_t)  ## (p, p_y)
-            alpha2_t = alph_t ** 2  ## (p, p_y)
-
-            ## Variance of Y columns: sum(Y.^2, 1)
+            ## alpha = diag(S) @ U^T @ Y (Karabatsos 2017, Eq. 15)
+            alpha2_t = (s_t[:, None] * (U_t.T @ Y_t)) ** 2  ## (p, p_y)
             Y_var_t = torch.sum(Y_t ** 2, dim=0)  ## (p_y,)
 
-            ## Phase 1 + Phase 2: vectorized NLL sweep for bounds
+            ## Coarse sweep for bracket bounds, then golden-section refinement
             bounds_t, hit_cap_t = _vectorized_nll_sweep(
-                q=q,
-                d2=d2_t[:q],
-                alpha2=alpha2_t[:q, :],
-                n=n,
-                Y_var=Y_var_t,
-                p_y=p_y,
-                device=dev,
+                q=q, d2=d2_t[:q], alpha2=alpha2_t[:q, :], n=n, Y_var=Y_var_t,
             )
-
-            ## Phase 3: vectorized golden-section refinement (replaces scipy Brent)
-            lambdas_opt_t, did_not_converge_t = _vectorized_golden_section(
-                d2=d2_t[:q],
-                alpha2=alpha2_t[:q, :],
-                n=n,
-                Y_var=Y_var_t,
-                q=q,
-                bounds=bounds_t,
-                xatol=1e-4,
-                max_iter=200,
+            lambdas_opt_t, gs_failed_t = _vectorized_golden_section(
+                d2=d2_t[:q], alpha2=alpha2_t[:q, :], n=n, Y_var=Y_var_t,
+                q=q, bounds=bounds_t,
             )
-
-            ## Propagate convergence failures: hit_cap OR golden-section didn't converge
-            convergence_failures_t = hit_cap_t | did_not_converge_t  ## (p_y,)
 
             lambdas_final = lambdas_opt_t.cpu().numpy()  ## (p_y,)
-            convergence_failures = convergence_failures_t.cpu().numpy()
+            convergence_failures = (hit_cap_t | gs_failed_t).cpu().numpy()
 
-            ## Free GPU memory
-            del X_t, Y_t, U_t, s_t, Vh_t, d2_t, alph_t, alpha2_t, Y_var_t
-            del bounds_t, hit_cap_t, lambdas_opt_t, did_not_converge_t, convergence_failures_t
+            del X_t, Y_t, U_t, s_t, d2_t, alpha2_t, Y_var_t
+            del bounds_t, hit_cap_t, lambdas_opt_t, gs_failed_t
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
         else:
             lambdas_final = lambdas_precomputed
 
-        ## -----------------------------------------------------------
-        ## Beta solve via _batched_solve (recenter=True path only)
-        ## -----------------------------------------------------------
+        ## Beta solve: (X^T X + lambda_i * I) @ beta_i = X^T Y_i
         X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
         Y_t = torch.as_tensor(Y_centered, dtype=torch.float64, device=dev)
         lambdas_t = torch.as_tensor(lambdas_final, dtype=torch.float64, device=dev)
 
-        XTX_t = X_t.T @ X_t  ## (p_x, p_x)
-        ep_t = torch.eye(p_x, dtype=torch.float64, device=dev)  ## (p_x, p_x)
-        XTY_t = X_t.T @ Y_t  ## (p_x, p_y)
-
         betas_t = _batched_solve(
-            XTX=XTX_t,
-            ep=ep_t,
+            XTX=X_t.T @ X_t,
+            ep=torch.eye(p_x, dtype=torch.float64, device=dev),
             lambdas=lambdas_t,
-            XTY=XTY_t,
+            XTY=X_t.T @ Y_t,
             batch_size=self.batch_size_solve,
         )  ## (p_x, p_y)
 
-        ## Undo z-scoring: betas /= X_std
+        ## Undo z-scoring: betas were fit on X/X_std, so divide by X_std to
+        ## get coefficients that operate on raw (unscaled) X.
         X_std_t = torch.as_tensor(X_std, dtype=torch.float64, device=dev)  ## (p_x,)
         betas_t = betas_t / X_std_t[:, None]  ## (p_x, p_y)
 
-        ## -----------------------------------------------------------
-        ## Compute intercept: Y_mean - X_mean_raw @ coef_
-        ## -----------------------------------------------------------
-        X_mean_raw_t = torch.as_tensor(X_mean_raw, dtype=torch.float64, device=dev)  ## (p_x,)
-        Y_mean_t = torch.as_tensor(Y_mean, dtype=torch.float64, device=dev)  ## (p_y,)
+        ## Intercept: predict(X_raw) = X_raw @ coef_ + intercept_
+        ##   = X_raw @ coef_ + Y_mean - X_mean_raw @ coef_
+        ##   = (X_raw - X_mean_raw) @ coef_ + Y_mean
+        ## which reproduces the centered regression.
+        X_mean_raw_t = torch.as_tensor(X_mean_raw, dtype=torch.float64, device=dev)
+        Y_mean_t = torch.as_tensor(Y_mean, dtype=torch.float64, device=dev)
         intercept_t = Y_mean_t - X_mean_raw_t @ betas_t  ## (p_y,)
 
-        ## -----------------------------------------------------------
-        ## Convert outputs to numpy
-        ## -----------------------------------------------------------
-        coef_np = betas_t.cpu().numpy()  ## (p_x, p_y)
-        intercept_np = intercept_t.cpu().numpy()  ## (p_y,)
+        ## Store results, matching input type
+        coef_np = betas_t.cpu().numpy()
+        intercept_np = intercept_t.cpu().numpy()
 
-        ## Free GPU memory
-        del X_t, Y_t, lambdas_t, XTX_t, ep_t, XTY_t, betas_t
-        del X_std_t, X_mean_raw_t, Y_mean_t, intercept_t
+        del X_t, Y_t, lambdas_t, betas_t, X_std_t, X_mean_raw_t, Y_mean_t, intercept_t
         if dev.type == "cuda":
             torch.cuda.empty_cache()
 
-        ## -----------------------------------------------------------
-        ## Store results, matching input type (np or torch)
-        ## -----------------------------------------------------------
         if input_is_torch:
             self.coef_ = torch.as_tensor(coef_np, device=input_device)
             self.intercept_ = torch.as_tensor(intercept_np, device=input_device)
@@ -762,10 +695,6 @@ class RidgeMML(LinearRegression_sk):
             self.convergence_failures_ = convergence_failures
 
         return self
-
-    ## -----------------------------------------------------------
-    ## Override to/cpu/numpy to handle lambdas_ and convergence_failures_
-    ## -----------------------------------------------------------
 
     def to(self, device):
         """Move all fitted attributes to the given device."""
@@ -783,15 +712,13 @@ class RidgeMML(LinearRegression_sk):
 
     def numpy(self):
         """Convert all fitted attributes to numpy arrays."""
-        def _convert(x):
-            if isinstance(x, torch.Tensor):
-                return x.detach().cpu().numpy()
-            return x
+        def _to_np(x):
+            return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
 
-        self.coef_ = _convert(self.coef_)
-        self.intercept_ = _convert(self.intercept_)
+        self.coef_ = _to_np(self.coef_)
+        self.intercept_ = _to_np(self.intercept_)
         if hasattr(self, "lambdas_"):
-            self.lambdas_ = _convert(self.lambdas_)
+            self.lambdas_ = _to_np(self.lambdas_)
         if hasattr(self, "convergence_failures_"):
-            self.convergence_failures_ = _convert(self.convergence_failures_)
+            self.convergence_failures_ = _to_np(self.convergence_failures_)
         return self
