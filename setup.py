@@ -43,7 +43,7 @@ setup(
     author='Richard Hakim',
     keywords=['data analysis', 'machine learning', 'neuroscience'],
     license='LICENSE',
-    description='A library of useful modules for data analysis.',
+    description='Closed-form linear regression models (OLS, Ridge, Ridge variants) using PyTorch.',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     url='https://github.com/RichieHakim/torch_linear_regression',

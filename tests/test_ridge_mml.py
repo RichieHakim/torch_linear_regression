@@ -257,3 +257,48 @@ def test_coef_intercept_against_numpy_reference():
 
     np.testing.assert_allclose(model.coef_, coef_expected, rtol=1e-10)
     np.testing.assert_allclose(model.intercept_, intercept_expected, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# 12. prefit: same result as non-prefit
+# ---------------------------------------------------------------------------
+def test_prefit_matches_no_prefit():
+    """prefit_X should give identical results to fitting without prefit."""
+    X, y = make_regression(
+        n_samples=200,
+        n_features=15,
+        n_targets=5,
+        random_state=8,
+    )
+    model_plain = RidgeMML(fit_intercept=True)
+    model_plain.fit(X, y)
+
+    model_prefit = RidgeMML(fit_intercept=True, prefit_X=X)
+    model_prefit.fit(X, y)
+
+    np.testing.assert_allclose(model_prefit.coef_, model_plain.coef_, rtol=1e-10)
+    np.testing.assert_allclose(model_prefit.intercept_, model_plain.intercept_, rtol=1e-10)
+    np.testing.assert_allclose(model_prefit.lambdas_, model_plain.lambdas_, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# 13. prefit: reuse for multiple Y matrices
+# ---------------------------------------------------------------------------
+def test_prefit_multiple_fits():
+    """Fitting the same prefit model with different Y targets should work."""
+    rng = np.random.RandomState(9)
+    X = rng.randn(200, 10)
+    Y1 = rng.randn(200, 3)
+    Y2 = rng.randn(200, 4)
+
+    model = RidgeMML(prefit_X=X)
+
+    model.fit(X, Y1)
+    assert model.coef_.shape == (10, 3)
+    assert model.lambdas_.shape == (3,)
+    r2_1 = model.score(X, Y1)
+
+    model.fit(X, Y2)
+    assert model.coef_.shape == (10, 4)
+    assert model.lambdas_.shape == (4,)
+    r2_2 = model.score(X, Y2)

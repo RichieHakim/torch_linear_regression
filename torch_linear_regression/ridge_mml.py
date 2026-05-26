@@ -477,6 +477,11 @@ class RidgeMML(LinearRegression_sk):
             Y columns to solve simultaneously in the beta solve.
             ``None`` (default) means all at once. Reduce for large ``p_y``
             to limit GPU memory.
+        prefit_X (Optional[Union[np.ndarray, torch.Tensor]]):
+            If provided, precomputes X preprocessing (z-scoring, centering)
+            and SVD at construction time. Subsequent ``fit()`` calls reuse
+            these cached results, skipping the most expensive X-only work.
+            Useful when fitting the same X to many different Y matrices.
 
     Attributes:
         coef_ (Union[np.ndarray, torch.Tensor]):
@@ -504,6 +509,11 @@ class RidgeMML(LinearRegression_sk):
         model.fit(X, Y)
         Y_pred = model.predict(X)
         print(model.score(X, Y))
+
+        ## Prefit: cache X preprocessing + SVD for repeated fits
+        model_pf = RidgeMML(prefit_X=X)
+        model_pf.fit(X, Y[:, :3])   ## fast -- reuses cached SVD
+        model_pf.fit(X, Y[:, 3:])   ## fast again
     """
 
     def __init__(
@@ -512,12 +522,82 @@ class RidgeMML(LinearRegression_sk):
         lambdas: Optional[np.ndarray] = None,
         device: Optional[Union[str, torch.device]] = None,
         batch_size_solve: Optional[int] = None,
+        prefit_X: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ):
         super(RidgeMML, self).__init__()
         self.fit_intercept = fit_intercept
         self.lambdas = lambdas
         self.device = device
         self.batch_size_solve = batch_size_solve
+
+        self._prefit_data = self.prefit(prefit_X) if prefit_X is not None else None
+
+    def prefit(
+        self,
+        X: Union[np.ndarray, torch.Tensor],
+    ) -> dict:
+        """
+        Precompute X preprocessing (z-scoring, centering) and SVD.
+
+        The returned dict is stored internally and reused by ``fit()`` to
+        skip these steps. This is the most expensive Y-independent work;
+        caching it is useful when fitting the same X to many different Y
+        matrices.
+
+        Args:
+            X (Union[np.ndarray, torch.Tensor]):
+                Design matrix. Shape: ``(n, p_x)``.
+
+        Returns:
+            (dict):
+                Cached preprocessing and SVD results (numpy arrays).
+        """
+        if isinstance(X, torch.Tensor):
+            X_np = X.detach().cpu().numpy().astype(np.float64)
+        else:
+            X_np = np.asarray(X, dtype=np.float64)
+
+        if X_np.ndim != 2:
+            raise ValueError(f"X must be 2-D, got ndim={X_np.ndim}")
+
+        dev = _select_device(self.device)
+        n, p_x = X_np.shape
+
+        ## Z-score and mean-center X (ddof=1 for sample std)
+        X_mean_raw = X_np.mean(axis=0)  ## (p_x,)
+        X_std = np.std(X_np, axis=0, ddof=1)  ## (p_x,)
+        X_std[X_std == 0] = 1.0
+        X_zscored = X_np / X_std[None, :]  ## (n, p_x)
+        X_centered = X_zscored - X_zscored.mean(axis=0)[None, :]  ## (n, p_x)
+
+        ## SVD of centered, z-scored X
+        X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
+        U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,)
+
+        ## Count numerically valid singular values.
+        ## Threshold scales with index: s_j must exceed eps(U[0,0]) * j.
+        eps_u1 = np.spacing(U_t[0, 0].cpu().item())
+        threshold_t = eps_u1 * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
+        q = int((s_t > threshold_t).sum().item())
+
+        ## Store everything as numpy to avoid device-mismatch issues
+        ## between prefit and fit (torch upload is cheap vs SVD)
+        prefit_data = {
+            "X_mean_raw": X_mean_raw,       ## (p_x,)
+            "X_std": X_std,                  ## (p_x,)
+            "X_centered": X_centered,        ## (n, p_x)
+            "U": U_t.cpu().numpy(),          ## (n, p_x)
+            "s": s_t.cpu().numpy(),          ## (p_x,)
+            "q": q,                          ## int
+            "n": n,
+            "p_x": p_x,
+        }
+
+        del X_t, U_t, s_t
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return prefit_data
 
     def fit(
         self,
@@ -527,9 +607,14 @@ class RidgeMML(LinearRegression_sk):
         """
         Fit ridge regression with MML lambda estimation.
 
+        If ``prefit_X`` was provided at construction (or ``prefit()`` was
+        called), the cached X preprocessing and SVD are reused and the
+        ``X`` argument is ignored.
+
         Args:
             X (Union[np.ndarray, torch.Tensor]):
                 Design matrix (no intercept column). Shape: ``(n, p_x)``.
+                Ignored when prefit data is available.
             y (Union[np.ndarray, torch.Tensor]):
                 Outcome matrix. Shape: ``(n, p_y)`` or ``(n,)``.
 
@@ -554,40 +639,63 @@ class RidgeMML(LinearRegression_sk):
         input_device = X.device if input_is_torch else None
 
         if input_is_torch:
-            X_np = X.detach().cpu().numpy().astype(np.float64)
             y_np = y.detach().cpu().numpy().astype(np.float64)
         else:
-            X_np = np.asarray(X, dtype=np.float64)
             y_np = np.asarray(y, dtype=np.float64)
 
-        if X_np.ndim != 2:
-            raise ValueError(f"X must be 2-D, got ndim={X_np.ndim}")
         if y_np.ndim == 1:
             y_np = y_np[:, None]  ## (n,) -> (n, 1)
         if y_np.ndim != 2:
             raise ValueError(f"y must be 1-D or 2-D, got ndim={y_np.ndim}")
-        if X_np.shape[0] != y_np.shape[0]:
-            raise ValueError(
-                f"Shape mismatch: X has {X_np.shape[0]} rows, "
-                f"y has {y_np.shape[0]} rows"
-            )
 
-        n, p_x = X_np.shape
-        p_y = y_np.shape[1]
-        self.n_features_in_ = p_x
         dev = _select_device(self.device)
 
-        ## Preprocessing: mean-center Y, z-score and mean-center X.
-        ## Z-scoring uses ddof=1 (sample std) for consistency with the original algorithm.
-        ## Constant columns get std=1 to avoid division by zero.
-        X_mean_raw = X_np.mean(axis=0)  ## (p_x,) -- saved for intercept derivation
+        ## Use prefit data if available, otherwise preprocess X now
+        if self._prefit_data is not None:
+            pf = self._prefit_data
+            X_mean_raw = pf["X_mean_raw"]
+            X_std = pf["X_std"]
+            X_centered = pf["X_centered"]
+            U_np = pf["U"]
+            s_np = pf["s"]
+            q = pf["q"]
+            n = pf["n"]
+            p_x = pf["p_x"]
+        else:
+            if input_is_torch:
+                X_np = X.detach().cpu().numpy().astype(np.float64)
+            else:
+                X_np = np.asarray(X, dtype=np.float64)
+
+            if X_np.ndim != 2:
+                raise ValueError(f"X must be 2-D, got ndim={X_np.ndim}")
+
+            n, p_x = X_np.shape
+
+            ## Z-score and mean-center X (ddof=1 for sample std).
+            ## Constant columns get std=1 to avoid division by zero.
+            X_mean_raw = X_np.mean(axis=0)  ## (p_x,) -- saved for intercept derivation
+            X_std = np.std(X_np, axis=0, ddof=1)  ## (p_x,)
+            X_std[X_std == 0] = 1.0
+            X_zscored = X_np / X_std[None, :]  ## (n, p_x)
+            X_centered = X_zscored - X_zscored.mean(axis=0)[None, :]  ## (n, p_x)
+
+            ## SVD will be computed below if needed; set to None as sentinel
+            U_np = None
+            s_np = None
+            q = None
+
+        if y_np.shape[0] != n:
+            raise ValueError(
+                f"Shape mismatch: X has {n} rows, y has {y_np.shape[0]} rows"
+            )
+
+        p_y = y_np.shape[1]
+        self.n_features_in_ = p_x
+
+        ## Mean-center Y
         Y_mean = y_np.mean(axis=0)  ## (p_y,)
         Y_centered = y_np - Y_mean[None, :]  ## (n, p_y)
-
-        X_std = np.std(X_np, axis=0, ddof=1)  ## (p_x,)
-        X_std[X_std == 0] = 1.0
-        X_zscored = X_np / X_std[None, :]  ## (n, p_x)
-        X_centered = X_zscored - X_zscored.mean(axis=0)[None, :]  ## (n, p_x)
 
         ## Resolve lambdas: pre-supplied, single-regressor shortcut, or MML
         compute_lambdas = True
@@ -611,19 +719,22 @@ class RidgeMML(LinearRegression_sk):
         convergence_failures = np.zeros(p_y, dtype=bool)
 
         if compute_lambdas:
-            X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
             Y_t = torch.as_tensor(Y_centered, dtype=torch.float64, device=dev)
 
-            ## SVD of centered, z-scored X
-            U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,)
+            ## Use cached SVD if available, otherwise compute now
+            if U_np is not None:
+                U_t = torch.as_tensor(U_np, dtype=torch.float64, device=dev)
+                s_t = torch.as_tensor(s_np, dtype=torch.float64, device=dev)
+            else:
+                X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
+                U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,)
+                del X_t
 
-            ## Count numerically valid singular values.
-            ## Threshold scales with index: s_j must exceed eps(U[0,0]) * j.
-            ## This discards singular values that are indistinguishable from
-            ## roundoff in U, preventing them from dominating the NLL.
-            eps_u1 = np.spacing(U_t[0, 0].cpu().item())
-            threshold_t = eps_u1 * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
-            q = int((s_t > threshold_t).sum().item())
+                ## Count numerically valid singular values.
+                ## Threshold scales with index: s_j must exceed eps(U[0,0]) * j.
+                eps_u1 = np.spacing(U_t[0, 0].cpu().item())
+                threshold_t = eps_u1 * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
+                q = int((s_t > threshold_t).sum().item())
 
             d2_t = s_t ** 2  ## (p,)
             ## alpha = diag(S) @ U^T @ Y (Karabatsos 2017, Eq. 15)
@@ -642,7 +753,7 @@ class RidgeMML(LinearRegression_sk):
             lambdas_final = lambdas_opt_t.cpu().numpy()  ## (p_y,)
             convergence_failures = (hit_cap_t | gs_failed_t).cpu().numpy()
 
-            del X_t, Y_t, U_t, s_t, d2_t, alpha2_t, Y_var_t
+            del Y_t, U_t, s_t, d2_t, alpha2_t, Y_var_t
             del bounds_t, hit_cap_t, lambdas_opt_t, gs_failed_t
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
