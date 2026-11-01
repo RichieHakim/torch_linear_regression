@@ -7,8 +7,8 @@ A very simple library containing closed-form linear regression models using PyTo
 
 ### Models
 - **OLS** -- Ordinary Least Squares: `(X'X)^-1 X'Y`
-- **Ridge** -- Ridge regression: `(X'X + lambda*I)^-1 X'Y`. The penalty is a fixed scalar, or, with `prefit_includes_alpha=False`, can change on every fit and differ per column of Y
-- **ReducedRankRidgeRegression** -- Ridge regression followed by SVD truncation of the weight matrix
+- **Ridge** -- Ridge regression: `(X'X + lambda*I)^-1 X'Y`. The penalty is a fixed scalar, or, with `prefit_includes_alpha=False`, can change on every fit and differ per column of Y. The intercept is not penalized, as in scikit-learn's `Ridge`
+- **ReducedRankRidgeRegression** -- Ridge regression followed by SVD truncation of the weight matrix. The intercept is not penalized
 - **RidgeMML** -- Ridge regression with automatic per-column lambda estimation ([Karabatsos 2017](http://www.tandfonline.com/doi/pdf/10.1080/03610918.2017.1321119)).
 
 The closed-form approach results in fast and accurate results under most
@@ -60,6 +60,13 @@ scalar or as one value per column of Y, and costs only small matrix products.
 The SVD is also far smaller than the `(n_features, n_features)` inverse when
 `n_features > n_samples`. Both prefit modes give the same solution for the
 same `alpha`.
+
+In both modes, the intercept is not penalized. With `fit_intercept=True`
+(the default), the columns of `X` and `Y` are centered before the solve, and
+the intercept is `mean(Y) - mean(X) @ coef`. The results match
+`sklearn.linear_model.Ridge`. Version 0.2.0 and earlier fit the intercept as a
+penalized column of ones, which shrank it toward zero when `alpha` was large
+compared with `n_samples`.
 
 ```python
 X = np.random.randn(1000, 5000)
@@ -117,5 +124,5 @@ Key differences from `Ridge`:
 |---|---|---|
 | Lambda | User-specified: one scalar, or one per column of Y with `prefit_includes_alpha=False` | Per-column of Y, estimated via MML |
 | X standardization | None | Intrinsic z-scoring (ddof=1) |
-| Intercept | Optional | Always (derived from column means) |
+| Intercept | Optional, not penalized | Always (derived from column means) |
 | Dependencies | numpy, torch | numpy, torch |

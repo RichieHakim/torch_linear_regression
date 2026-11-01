@@ -379,15 +379,18 @@ class Ridge(LinearRegression_sk):
         fit_intercept (bool):
             Whether to calculate the intercept for this model. If set to
             ``False``, no intercept will be used in calculations (i.e., data is
-            expected to be centered). NOTE: The intercept is fit as an extra
-            column of ones in ``X``, so ``alpha`` penalizes it too. (Default is
-            ``False``)
+            expected to be centered). If ``True``, the intercept is not
+            penalized, as in ``sklearn.linear_model.Ridge``: the columns of
+            ``X`` and ``y`` are centered, the penalized problem is solved on
+            the centered data, and ``intercept_ = mean(y) - mean(X) @ coef_``.
         prefit_X (Optional[np.ndarray, torch.Tensor]):
             Optional. If the ``X`` array is provided here, then the matrices
             chosen by ``prefit_includes_alpha`` will be precomputed and stored
-            in the model.
+            in the model, along with the column means of ``X`` if
+            ``fit_intercept``.
         prefit_includes_alpha (bool):
-            Chooses what is precomputed and how ``fit`` solves. \n
+            Chooses what is precomputed and how ``fit`` solves. ``X`` below is
+            centered if ``fit_intercept``. \n
             * ``True``: ``inv(X.T @ X + alpha*eye(X.shape[1])) @ X.T`` (see
               ``prefit``). ``alpha`` is fixed when the model is created. \n
             * ``False``: the thin SVD of ``X`` (see ``prefit_svd``), which does
@@ -412,6 +415,10 @@ class Ridge(LinearRegression_sk):
         svd_X (Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]):
             Stores the precomputed thin SVD ``(U, s, Vt)`` of ``X`` if
             precomputed, otherwise ``None``.
+        X_mean_prefit (Optional[np.ndarray]):
+            Column means of ``prefit_X``, used to center ``X`` and compute the
+            intercept. ``None`` if there is no prefit or ``fit_intercept`` is
+            ``False``.
     """
     def __init__(
         self, 
@@ -432,12 +439,13 @@ class Ridge(LinearRegression_sk):
 
         self.iXTXaeXT = self.prefit(prefit_X) if (prefit_X is not None) and prefit_includes_alpha else None
         self.svd_X = self.prefit_svd(prefit_X) if (prefit_X is not None) and (not prefit_includes_alpha) else None
+        self.X_mean_prefit = prefit_X.mean(0) if (prefit_X is not None) and fit_intercept else None
         self.prefit_X = True if prefit_X is not None else False
 
     def prefit(self, X):
         """
         Precomputes ``inv(X.T @ X + alpha*eye(X.shape[1])) @ X.T`` to be used in
-        the `fit` method.
+        the `fit` method. ``X`` is centered first if ``fit_intercept``.
 
         Args:
             X (np.ndarray): 
@@ -449,18 +457,18 @@ class Ridge(LinearRegression_sk):
                 X.T``.
         """
         ns = self.get_backend_namespace(X=X)
-        cat, eye, inv, ones = (ns[key] for key in ['cat', 'eye', 'inv', 'ones'])
+        eye, inv = (ns[key] for key in ['eye', 'inv'])
         if self.fit_intercept:
-            X = cat((X, ones((X.shape[0], 1))), axis=1)
+            X = X - X.mean(0)  ## (n_samples, n_features). Centered so that the intercept is not penalized
                 
         inv_XT_X_plus_alpha_eye_XT = inv(X.T @ X + self.alpha*eye(X.shape[1])) @ X.T
         return inv_XT_X_plus_alpha_eye_XT
 
     def prefit_svd(self, X):
         """
-        Precomputes the thin SVD of ``X`` (with a column of ones appended if
-        ``fit_intercept``) to be used in the `fit` method when
-        ``prefit_includes_alpha=False``. It does not depend on ``alpha``.
+        Precomputes the thin SVD of ``X`` (centered first if ``fit_intercept``)
+        to be used in the `fit` method when ``prefit_includes_alpha=False``. It
+        does not depend on ``alpha``.
 
         Args:
             X (np.ndarray):
@@ -470,13 +478,12 @@ class Ridge(LinearRegression_sk):
             Tuple[np.ndarray, np.ndarray, np.ndarray]:
                 ``(U, s, Vt)`` such that ``X == U @ diag(s) @ Vt``. Shapes:
                 ``(n_samples, k)``, ``(k,)``, ``(k, n_features)``, where ``k =
-                min(n_samples, n_features)`` and ``n_features`` includes the
-                column of ones.
+                min(n_samples, n_features)``.
         """
         ns = self.get_backend_namespace(X=X)
-        cat, ones, svd = (ns[key] for key in ['cat', 'ones', 'svd'])
+        svd = ns['svd']
         if self.fit_intercept:
-            X = cat((X, ones((X.shape[0], 1))), axis=1)
+            X = X - X.mean(0)  ## (n_samples, n_features). Centered so that the intercept is not penalized
 
         U, s, Vt = svd(X, full_matrices=False)
         return U, s, Vt
@@ -504,6 +511,13 @@ class Ridge(LinearRegression_sk):
         ns = self.get_backend_namespace(X=X, y=y)
         as_array, zeros = (ns[key] for key in ['as_array', 'zeros'])
 
+        ## Center y so that the intercept is not penalized. The prefit
+        ## matrices are made from centered X.
+        if self.fit_intercept:
+            X_mean = X.mean(0) if self.X_mean_prefit is None else self.X_mean_prefit  ## (n_features,)
+            y_mean = y.mean(0)  ## () or (n_targets,)
+            y = y - y_mean
+
         ## Regression algorithm
         if self.prefit_includes_alpha:
             assert alpha is None, 'Passing alpha to fit requires prefit_includes_alpha=False'
@@ -526,10 +540,10 @@ class Ridge(LinearRegression_sk):
             theta = Vt.T @ (shrinkage * (U.T @ y_2d))  ## (n_features, n_targets)
             theta = theta[:, 0] if y.ndim == 1 else theta
 
-        ### Extract bias terms
+        ### Intercept from the means
         if self.fit_intercept:
-            self.intercept_ = theta[-1]
-            self.coef_ = theta[:-1]
+            self.coef_ = theta
+            self.intercept_ = y_mean - X_mean @ theta  ## () or (n_targets,)
         else:
             self.intercept_ = zeros((y.shape[1],)) if y.ndim == 2 else 0
             self.coef_ = theta
@@ -557,13 +571,16 @@ class ReducedRankRidgeRegression(LinearRegression_sk):
             Regularizes the estimate to prevent overfitting by constraining the
             size of the coefficients. Usually ~1e5. (Default is 1)
         fit_intercept (bool):
-            Specifies whether to calculate the intercept for this model. If set
-            to ``True``, a column of ones is added to the feature matrix \(X\).
+            Specifies whether to calculate the intercept for this model. If
+            ``True``, the intercept is not penalized: the columns of ``X`` and
+            ``y`` are centered, the rank-reduced ridge solution is found on the
+            centered data, and ``intercept_ = mean(y) - mean(X) @ coef_``.
             (Default is ``True``)
         prefit_X (Optional[np.ndarray, torch.Tensor]):
             Optional. If the ``X`` array is provided here, then ``inv(X^T X +
-            alpha*eye(X.shape[1])) @ X^T`` will be precomputed and stored
-            in the model.
+            alpha*eye(X.shape[1])) @ X^T`` (``X`` centered if
+            ``fit_intercept``) will be precomputed and stored in the model,
+            along with the column means of ``X``.
 
     Attributes:
         rank (int):
@@ -572,9 +589,12 @@ class ReducedRankRidgeRegression(LinearRegression_sk):
             Regularization parameter.
         fit_intercept (bool):
             Specifies if the intercept should be calculated.
-        iXTXaeXT (Optional[np.ndarray]):
+        iXTXXT (Optional[np.ndarray]):
             Stores the precomputed ``inv(X.T @ X + alpha*eye(X.shape[1])) @
             X.T`` if precomputed, otherwise ``None``.
+        X_mean_prefit (Optional[np.ndarray]):
+            Column means of ``prefit_X``, used to compute the intercept.
+            ``None`` if there is no prefit or ``fit_intercept`` is ``False``.
     """
 
     def __init__(
@@ -595,12 +615,13 @@ class ReducedRankRidgeRegression(LinearRegression_sk):
         self.alpha = alpha
 
         self.iXTXXT = self.prefit(prefit_X) if prefit_X is not None else None
+        self.X_mean_prefit = prefit_X.mean(0) if (prefit_X is not None) and fit_intercept else None
         self.prefit_X = True if prefit_X is not None else False
 
     def prefit(self, X):
         """
         Precomputes the \(X^T X + \alpha I\) inverse times \(X^T\) to be used in
-        the `fit` method.
+        the `fit` method. ``X`` is centered first if ``fit_intercept``.
 
         Args:
             X (np.ndarray): 
@@ -611,9 +632,9 @@ class ReducedRankRidgeRegression(LinearRegression_sk):
                 Precomputed inverse of \(X^T X + \alpha I\) times \(X^T\).
         """
         ns = self.get_backend_namespace(X=X)
-        cat, eye, inv, ones = (ns[key] for key in ['cat', 'eye', 'inv', 'ones'])
+        eye, inv = (ns[key] for key in ['eye', 'inv'])
         if self.fit_intercept:
-            X = cat((X, ones((X.shape[0], 1))), axis=1)
+            X = X - X.mean(0)  ## (n_samples, n_features). Centered so that the intercept is not penalized
                 
         inv_XT_X_plus_alpha_eye_XT = inv(X.T @ X + self.alpha*eye(X.shape[1])) @ X.T
         return inv_XT_X_plus_alpha_eye_XT
@@ -644,7 +665,14 @@ class ReducedRankRidgeRegression(LinearRegression_sk):
         ns = self.get_backend_namespace(X=X, y=y)
         svd, zeros = (ns[key] for key in ['svd', 'zeros'])
 
-        ## Calculate OLS solution
+        ## Center y so that the intercept is not penalized. The prefit matrix
+        ## is made from centered X.
+        if self.fit_intercept:
+            X_mean = X.mean(0) if self.X_mean_prefit is None else self.X_mean_prefit  ## (n_features,)
+            y_mean = y.mean(0)  ## (n_targets,)
+            y = y - y_mean
+
+        ## Calculate ridge solution
         inv_XT_X_plus_alpha_eye_XT = self.prefit(X) if self.iXTXXT is None else self.iXTXXT
         B_r = inv_XT_X_plus_alpha_eye_XT @ y
 
@@ -655,10 +683,10 @@ class ReducedRankRidgeRegression(LinearRegression_sk):
         Vt = Vt[:self.rank]
         B_rrr = B_r @ Vt.T @ Vt
 
-        ### Extract bias terms
+        ### Intercept from the means
         if self.fit_intercept:
-            self.intercept_ = B_rrr[-1]
-            self.coef_ = B_rrr[:-1]
+            self.coef_ = B_rrr
+            self.intercept_ = y_mean - X_mean @ B_rrr  ## (n_targets,)
         else:
             self.intercept_ = zeros((y.shape[1],)) if y.ndim == 2 else 0
             self.coef_ = B_rrr
