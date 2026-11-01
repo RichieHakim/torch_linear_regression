@@ -7,7 +7,7 @@ A very simple library containing closed-form linear regression models using PyTo
 
 ### Models
 - **OLS** -- Ordinary Least Squares: `(X'X)^-1 X'Y`
-- **Ridge** -- Ridge regression with a fixed scalar penalty: `(X'X + lambda*I)^-1 X'Y`
+- **Ridge** -- Ridge regression: `(X'X + lambda*I)^-1 X'Y`. The penalty is a fixed scalar, or, with `prefit_includes_alpha=False`, can change on every fit and differ per column of Y
 - **ReducedRankRidgeRegression** -- Ridge regression followed by SVD truncation of the weight matrix
 - **RidgeMML** -- Ridge regression with automatic per-column lambda estimation ([Karabatsos 2017](http://www.tandfonline.com/doi/pdf/10.1080/03610918.2017.1321119)).
 
@@ -20,7 +20,9 @@ consider using SVD / PCA to reduce the redundancy in your input matrix.
 
 OLS, Ridge, and ReducedRankRidgeRegression include a `model.prefit()` method
 that precomputes the inverse matrix. This is useful when fitting the same `X`
-to multiple targets.
+to multiple targets. Ridge's default prefit fixes the penalty;
+`prefit_includes_alpha=False` instead precomputes an SVD of `X` and takes the
+penalty at each fit (see below).
 
 ## Installation
 Install stable version:
@@ -49,6 +51,27 @@ model = tlr.OLS()
 model.fit(X=X, y=Y)
 Y_pred = model.predict(X)
 print(f"R^2: {model.score(X=X, y=Y):.4f}")
+```
+
+### Ridge penalty search
+With `prefit_includes_alpha=False`, Ridge precomputes the thin SVD of `X`,
+which does not depend on the penalty. Each `fit` then takes `alpha` as a
+scalar or as one value per column of Y, and costs only small matrix products.
+The SVD is also far smaller than the `(n_features, n_features)` inverse when
+`n_features > n_samples`. Both prefit modes give the same solution for the
+same `alpha`.
+
+```python
+X = np.random.randn(1000, 5000)
+Y = X[:, :50] @ np.random.randn(50, 100) + np.random.randn(1000, 100)
+X_train, X_test, Y_train, Y_test = X[:900], X[900:], Y[:900], Y[900:]
+
+model = tlr.Ridge(prefit_X=X_train, prefit_includes_alpha=False)
+for alpha in [1e1, 1e2, 1e3, 1e4]:
+    model.fit(X_train, Y_train, alpha=alpha)
+    print(f"alpha={alpha:.0e}  held-out R^2: {model.score(X_test, Y_test):.3f}")
+
+model.fit(X_train, Y_train, alpha=np.logspace(1, 4, 100))  ## one penalty per column of Y
 ```
 
 ### RidgeMML
@@ -92,7 +115,7 @@ Key differences from `Ridge`:
 
 | | `Ridge` | `RidgeMML` |
 |---|---|---|
-| Lambda | Single scalar, user-specified | Per-column of Y, estimated via MML |
+| Lambda | User-specified: one scalar, or one per column of Y with `prefit_includes_alpha=False` | Per-column of Y, estimated via MML |
 | X standardization | None | Intrinsic z-scoring (ddof=1) |
 | Intercept | Optional | Always (derived from column means) |
 | Dependencies | numpy, torch | numpy, torch |

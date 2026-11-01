@@ -78,6 +78,7 @@ class LinearRegression_sk(sklearn.base.BaseEstimator, sklearn.base.RegressorMixi
             ns['cat'] = np.concatenate
             ns['svd'] = np.linalg.svd
             ns['eigh'] = np.linalg.eigh
+            ns['as_array'] = functools.partial(np.asarray, dtype=dtype)
         elif backend == 'torch':
             ns['inv'] = torch.linalg.inv
             ns['eye'] = functools.partial(torch.eye, device=device, dtype=dtype)
@@ -86,6 +87,7 @@ class LinearRegression_sk(sklearn.base.BaseEstimator, sklearn.base.RegressorMixi
             ns['cat'] = torch.cat
             ns['svd'] = torch.linalg.svd
             ns['eigh'] = torch.linalg.eigh
+            ns['as_array'] = functools.partial(torch.as_tensor, device=device, dtype=dtype)
         else:
             raise NotImplementedError
         
@@ -371,30 +373,52 @@ class Ridge(LinearRegression_sk):
         alpha (float):
             The regularization strength which must be a positive float.
             Regularizes the estimate to prevent overfitting by constraining the
-            size of the coefficients. Usually ~1e5. (Default is 1)
+            size of the coefficients. Usually ~1e5. If
+            ``prefit_includes_alpha=False``, it can also be an array with one
+            value per target column of ``y``. (Default is 1)
         fit_intercept (bool):
             Whether to calculate the intercept for this model. If set to
             ``False``, no intercept will be used in calculations (i.e., data is
-            expected to be centered). (Default is ``False``)
+            expected to be centered). NOTE: The intercept is fit as an extra
+            column of ones in ``X``, so ``alpha`` penalizes it too. (Default is
+            ``False``)
         prefit_X (Optional[np.ndarray, torch.Tensor]):
-            Optional. If the ``X`` array is provided here, then ``inv(X.T @ X +
-            alpha*eye(X.shape[1])) @ X.T`` will be precomputed and stored in the
-            model.
+            Optional. If the ``X`` array is provided here, then the matrices
+            chosen by ``prefit_includes_alpha`` will be precomputed and stored
+            in the model.
+        prefit_includes_alpha (bool):
+            Chooses what is precomputed and how ``fit`` solves. \n
+            * ``True``: ``inv(X.T @ X + alpha*eye(X.shape[1])) @ X.T`` (see
+              ``prefit``). ``alpha`` is fixed when the model is created. \n
+            * ``False``: the thin SVD of ``X`` (see ``prefit_svd``), which does
+              not depend on ``alpha``. ``fit`` then accepts a new ``alpha`` on
+              every call, as a scalar or one value per target column. Each fit
+              costs only small matrix products, so one prefit can serve a
+              search over many penalties. The SVD is also much smaller than
+              the ``(n_features, n_features)`` inverse when ``n_features >
+              n_samples``. \n
+            Both choices give the same solution for the same ``alpha``.
 
     Attributes:
         alpha (float):
             Regularization parameter.
         fit_intercept (bool):
             Specifies if the intercept should be calculated.
+        prefit_includes_alpha (bool):
+            Specifies which matrices are precomputed.
         iXTXaeXT (Optional[np.ndarray]):
             Stores the precomputed ``inv(X.T @ X + alpha*eye(X.shape[1])) @
             X.T`` if precomputed, otherwise ``None``.
+        svd_X (Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]):
+            Stores the precomputed thin SVD ``(U, s, Vt)`` of ``X`` if
+            precomputed, otherwise ``None``.
     """
     def __init__(
         self, 
         alpha=1, 
         fit_intercept=True,
         prefit_X=None,
+        prefit_includes_alpha=True,
         **kwargs,
     ):
         """
@@ -404,8 +428,10 @@ class Ridge(LinearRegression_sk):
         super(Ridge, self).__init__()
         self.alpha = alpha
         self.fit_intercept = fit_intercept
+        self.prefit_includes_alpha = prefit_includes_alpha
 
-        self.iXTXaeXT = self.prefit(prefit_X) if prefit_X is not None else None
+        self.iXTXaeXT = self.prefit(prefit_X) if (prefit_X is not None) and prefit_includes_alpha else None
+        self.svd_X = self.prefit_svd(prefit_X) if (prefit_X is not None) and (not prefit_includes_alpha) else None
         self.prefit_X = True if prefit_X is not None else False
 
     def prefit(self, X):
@@ -430,7 +456,32 @@ class Ridge(LinearRegression_sk):
         inv_XT_X_plus_alpha_eye_XT = inv(X.T @ X + self.alpha*eye(X.shape[1])) @ X.T
         return inv_XT_X_plus_alpha_eye_XT
 
-    def fit(self, X, y):
+    def prefit_svd(self, X):
+        """
+        Precomputes the thin SVD of ``X`` (with a column of ones appended if
+        ``fit_intercept``) to be used in the `fit` method when
+        ``prefit_includes_alpha=False``. It does not depend on ``alpha``.
+
+        Args:
+            X (np.ndarray):
+                The input features matrix.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                ``(U, s, Vt)`` such that ``X == U @ diag(s) @ Vt``. Shapes:
+                ``(n_samples, k)``, ``(k,)``, ``(k, n_features)``, where ``k =
+                min(n_samples, n_features)`` and ``n_features`` includes the
+                column of ones.
+        """
+        ns = self.get_backend_namespace(X=X)
+        cat, ones, svd = (ns[key] for key in ['cat', 'ones', 'svd'])
+        if self.fit_intercept:
+            X = cat((X, ones((X.shape[0], 1))), axis=1)
+
+        U, s, Vt = svd(X, full_matrices=False)
+        return U, s, Vt
+
+    def fit(self, X, y, alpha=None):
         """
         Fits the Ridge regression model to the data.
 
@@ -439,6 +490,10 @@ class Ridge(LinearRegression_sk):
                 Training data features.
             y (np.ndarray): 
                 Target values.
+            alpha (Optional[Union[float, np.ndarray, torch.Tensor]]):
+                Only allowed if ``prefit_includes_alpha=False``. Regularization
+                strength for this fit, as a scalar or one value per target
+                column of ``y``. ``None`` uses ``self.alpha``.
 
         Returns:
             Ridge: 
@@ -446,17 +501,30 @@ class Ridge(LinearRegression_sk):
         """
         self.n_features_in_ = X.shape[1]
 
-        ## Give a UserWarning if n_features >= n_samples
-        if X.shape[1] >= X.shape[0]:
-            import warnings
-            warnings.warn('OLS solution is expected to diverge from sklearn solution when n_features >= n_samples')
-
         ns = self.get_backend_namespace(X=X, y=y)
-        zeros = ns['zeros']
+        as_array, zeros = (ns[key] for key in ['as_array', 'zeros'])
 
         ## Regression algorithm
-        inv_XT_X_plus_alpha_eye_XT = self.prefit(X) if self.iXTXaeXT is None else self.iXTXaeXT
-        theta = inv_XT_X_plus_alpha_eye_XT @ y
+        if self.prefit_includes_alpha:
+            assert alpha is None, 'Passing alpha to fit requires prefit_includes_alpha=False'
+
+            ## Give a UserWarning if n_features >= n_samples
+            if X.shape[1] >= X.shape[0]:
+                import warnings
+                warnings.warn('OLS solution is expected to diverge from sklearn solution when n_features >= n_samples')
+
+            inv_XT_X_plus_alpha_eye_XT = self.prefit(X) if self.iXTXaeXT is None else self.iXTXaeXT
+            theta = inv_XT_X_plus_alpha_eye_XT @ y
+        else:
+            ## theta = V @ diag(s / (s**2 + alpha)) @ U.T @ y, which equals inv(X.T @ X + alpha*I) @ X.T @ y
+            U, s, Vt = self.prefit_svd(X) if self.svd_X is None else self.svd_X
+            alpha = as_array(self.alpha if alpha is None else alpha)
+            y_2d = y[:, None] if y.ndim == 1 else y  ## (n_samples, n_targets)
+            assert alpha.ndim == 0 or alpha.shape == (y_2d.shape[1],), 'alpha must be a scalar or have one value per target column of y'
+
+            shrinkage = s[:, None] / (s[:, None] ** 2 + alpha)  ## (k, 1) + () or (n_targets,) -> (k, 1) or (k, n_targets)
+            theta = Vt.T @ (shrinkage * (U.T @ y_2d))  ## (n_features, n_targets)
+            theta = theta[:, 0] if y.ndim == 1 else theta
 
         ### Extract bias terms
         if self.fit_intercept:
