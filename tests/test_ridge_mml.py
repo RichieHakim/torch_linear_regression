@@ -9,6 +9,7 @@ NOTE: RidgeMML is being implemented in parallel. These tests assume:
 
 import pytest
 from sklearn.datasets import make_regression
+from sklearn.linear_model import RidgeCV
 import numpy as np
 import torch
 
@@ -302,3 +303,106 @@ def test_prefit_multiple_fits():
     assert model.coef_.shape == (10, 4)
     assert model.lambdas_.shape == (4,)
     r2_2 = model.score(X, Y2)
+
+
+# ---------------------------------------------------------------------------
+# 14. p >= n: fit and prefit run and agree
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("p_x", [49, 50, 51, 80, 500])
+def test_p_greater_than_n_fit_and_prefit(p_x):
+    """
+    fit() and prefit() work when features match or outnumber samples
+    (n = 50). The thin SVD returns min(n, p_x) singular values.
+    """
+    rng = np.random.RandomState(10)
+    ## 10 latent factors shared across features, plus independent noise
+    X = rng.randn(50, 10) @ rng.randn(10, p_x) / np.sqrt(10) + rng.randn(50, p_x)
+    y = X @ (rng.randn(p_x, 3) / np.sqrt(p_x)) + rng.randn(50, 3)
+
+    model_plain = RidgeMML().fit(X, y)
+    model_prefit = RidgeMML(prefit_X=X).fit(X, y)
+
+    assert model_plain.coef_.shape == (p_x, 3)
+    assert np.all(np.isfinite(model_plain.coef_))
+    np.testing.assert_allclose(model_prefit.lambdas_, model_plain.lambdas_, rtol=1e-10)
+    np.testing.assert_allclose(model_prefit.coef_, model_plain.coef_, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# 15. p >> n: interior lambda, test R^2 close to cross-validated ridge
+# ---------------------------------------------------------------------------
+def test_p_much_greater_than_n_matches_cv():
+    """
+    With p >> n, centered X fits centered y exactly at lambda = 0, so the
+    likelihood must not reward lambda -> 0. Data drawn from the ridge prior
+    (dense beta ~ N(0, 1/p), noise SD 2, X columns of variance ~2) have a
+    true lambda of noise variance / prior variance of the z-scored
+    coefficients = 4 / (2 / p) = 2p. The chosen lambdas should be near that,
+    not flagged, and predict as well as RidgeCV.
+    """
+    rng = np.random.RandomState(0)
+    n, n_test, p_x, p_y = 100, 1000, 1000, 3
+    ## 20 latent factors shared across features, plus independent noise
+    F = rng.randn(n + n_test, 20)
+    X = F @ rng.randn(20, p_x) / np.sqrt(20) + rng.randn(n + n_test, p_x)
+    Y = X @ (rng.randn(p_x, p_y) / np.sqrt(p_x)) + 2.0 * rng.randn(n + n_test, p_y)
+    X_train, X_test, Y_train, Y_test = X[:n], X[n:], Y[:n], Y[n:]
+
+    model = RidgeMML().fit(X_train, Y_train)
+
+    def r2(Y_true, Y_pred):
+        return 1 - ((Y_true - Y_pred) ** 2).sum(0) / ((Y_true - Y_true.mean(0)) ** 2).sum(0)
+
+    ## RidgeCV on X z-scored the same way, so its alpha is on RidgeMML's scale
+    X_std = X_train.std(axis=0, ddof=1)[None, :]
+    cv = RidgeCV(alphas=np.logspace(-3, 8, 67), alpha_per_target=True).fit(X_train / X_std, Y_train)
+    r2_mml = r2(Y_test, model.predict(X_test))
+    r2_cv = r2(Y_test, cv.predict(X_test / X_std))
+
+    assert not np.any(model.convergence_failures_)
+    lambda_true = 2.0 * p_x
+    assert np.all(model.lambdas_ > lambda_true / 10), f"lambdas_ = {model.lambdas_}"
+    assert np.all(model.lambdas_ < lambda_true * 10), f"lambdas_ = {model.lambdas_}"
+    assert np.all(r2_mml > 0), f"test R^2 = {r2_mml}"
+    np.testing.assert_allclose(r2_mml, r2_cv, atol=0.03)
+
+
+# ---------------------------------------------------------------------------
+# 16. p >= n - 1: an interpolating fit is flagged
+# ---------------------------------------------------------------------------
+def test_interpolating_fit_flagged():
+    """
+    If y lies along the top singular direction of centered X, the NLL rises
+    monotonically from lambda = 0, so the chosen lambda is ~0 and the fit
+    interpolates the training data. That is flagged in convergence_failures_.
+    """
+    rng = np.random.RandomState(3)
+    X = rng.randn(50, 200)
+    X_z = X / X.std(axis=0, ddof=1)[None, :]
+    U, _, _ = np.linalg.svd(X_z - X_z.mean(axis=0)[None, :], full_matrices=False)
+    y = 10.0 * U[:, 0]
+
+    model = RidgeMML().fit(X, y)
+
+    assert model.lambdas_[0] < 1e-3, f"lambdas_ = {model.lambdas_}"
+    assert model.convergence_failures_[0]
+
+
+# ---------------------------------------------------------------------------
+# 17. p < n: lambdas change only slightly from v0.2.0
+# ---------------------------------------------------------------------------
+def test_p_less_than_n_lambdas_close_to_v0_2_0():
+    """
+    v0.2.0 used n instead of n - 1 observations in the likelihood. For
+    p < n the correction moves lambda by O(1/n) (here +0.6% to +0.9%, at
+    n = 200). The reference lambdas below come from v0.2.0 on this data.
+    """
+    rng = np.random.RandomState(12)
+    X = rng.randn(200, 20) @ (rng.randn(20, 20) / np.sqrt(20))
+    Y = X @ (0.2 * rng.randn(20, 4)) + rng.randn(200, 4)
+
+    model = RidgeMML().fit(X, Y)
+
+    lambdas_v0_2_0 = np.array([15.3217690882386, 54.156673074509584, 46.619261547429886, 21.11343535303545])
+    np.testing.assert_allclose(model.lambdas_, lambdas_v0_2_0, rtol=0.02)
+    assert not np.any(model.convergence_failures_)

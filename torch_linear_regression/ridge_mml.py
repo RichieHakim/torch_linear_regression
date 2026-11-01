@@ -73,7 +73,9 @@ def _nll_batch(
         alpha2 (torch.Tensor):
             Squared alpha values (truncated to q). Shape: ``(q, p_y)``.
         n (int):
-            Number of observations.
+            Number of observations in the likelihood. ``RidgeMML.fit``
+            passes ``n_samples - 1`` because centering Y removes one
+            dimension (see ``RidgeMML.fit``).
         Y_var (torch.Tensor):
             Column-wise sum of squared (centered) Y. Shape: ``(p_y,)``.
         q (int):
@@ -124,7 +126,7 @@ def _nll_scalar_broadcast(
         alpha2 (torch.Tensor):
             Squared alpha values. Shape: ``(q, p_y)``.
         n (int):
-            Number of observations.
+            Number of observations in the likelihood (see ``_nll_batch``).
         q (int):
             Number of valid singular values.
         Y_var (torch.Tensor):
@@ -178,7 +180,7 @@ def _vectorized_nll_sweep(
         alpha2 (torch.Tensor):
             Squared alpha values (truncated to q). Shape: ``(q, p_y)``.
         n (int):
-            Number of observations.
+            Number of observations in the likelihood (see ``_nll_batch``).
         Y_var (torch.Tensor):
             Sum of squared Y column values. Shape: ``(p_y,)``.
 
@@ -320,7 +322,7 @@ def _vectorized_golden_section(
         alpha2 (torch.Tensor):
             Squared alpha values (truncated to q). Shape: ``(q, p_y)``.
         n (int):
-            Number of observations.
+            Number of observations in the likelihood (see ``_nll_batch``).
         Y_var (torch.Tensor):
             Sum of squared Y column values. Shape: ``(p_y,)``.
         q (int):
@@ -492,7 +494,10 @@ class RidgeMML(LinearRegression_sk):
             Estimated (or pre-supplied) ridge parameters, shape ``(p_y,)``.
         convergence_failures_ (Union[np.ndarray, torch.Tensor]):
             Boolean, shape ``(p_y,)``. True where the lambda search did not
-            converge.
+            converge or found no interior minimum: lambda hit the upper cap
+            (flat likelihood), or lambda is near 0 and the fit interpolates
+            the training data (less than half a residual degree of freedom
+            left; possible only when ``p_x >= n - 1``).
         n_features_in_ (int):
             Number of features seen during ``fit``.
 
@@ -572,13 +577,14 @@ class RidgeMML(LinearRegression_sk):
 
         ## SVD of centered, z-scored X
         X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
-        U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,)
+        U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,k), s:(k,), k = min(n, p_x)
 
         ## Count numerically valid singular values.
         ## Threshold scales with index: s_j must exceed eps(U[0,0]) * j.
+        ## Centered X has rank at most n - 1, so q is capped there.
         eps_u1 = np.spacing(U_t[0, 0].cpu().item())
-        threshold_t = eps_u1 * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
-        q = int((s_t > threshold_t).sum().item())
+        threshold_t = eps_u1 * torch.arange(1, s_t.shape[0] + 1, dtype=torch.float64, device=dev)
+        q = min(int((s_t > threshold_t).sum().item()), n - 1)
 
         ## Store everything as numpy to avoid device-mismatch issues
         ## between prefit and fit (torch upload is cheap vs SVD)
@@ -586,8 +592,8 @@ class RidgeMML(LinearRegression_sk):
             "X_mean_raw": X_mean_raw,       ## (p_x,)
             "X_std": X_std,                  ## (p_x,)
             "X_centered": X_centered,        ## (n, p_x)
-            "U": U_t.cpu().numpy(),          ## (n, p_x)
-            "s": s_t.cpu().numpy(),          ## (p_x,)
+            "U": U_t.cpu().numpy(),          ## (n, k)
+            "s": s_t.cpu().numpy(),          ## (k,)
             "q": q,                          ## int
             "n": n,
             "p_x": p_x,
@@ -727,34 +733,54 @@ class RidgeMML(LinearRegression_sk):
                 s_t = torch.as_tensor(s_np, dtype=torch.float64, device=dev)
             else:
                 X_t = torch.as_tensor(X_centered, dtype=torch.float64, device=dev)
-                U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,p), s:(p,)
+                U_t, s_t, _ = torch.linalg.svd(X_t, full_matrices=False)  ## U:(n,k), s:(k,), k = min(n, p_x)
                 del X_t
 
                 ## Count numerically valid singular values.
                 ## Threshold scales with index: s_j must exceed eps(U[0,0]) * j.
+                ## Centered X has rank at most n - 1, so q is capped there.
                 eps_u1 = np.spacing(U_t[0, 0].cpu().item())
-                threshold_t = eps_u1 * torch.arange(1, p_x + 1, dtype=torch.float64, device=dev)
-                q = int((s_t > threshold_t).sum().item())
+                threshold_t = eps_u1 * torch.arange(1, s_t.shape[0] + 1, dtype=torch.float64, device=dev)
+                q = min(int((s_t > threshold_t).sum().item()), n - 1)
 
-            d2_t = s_t ** 2  ## (p,)
+            d2_t = s_t ** 2  ## (k,)
             ## alpha = diag(S) @ U^T @ Y (Karabatsos 2017, Eq. 15)
-            alpha2_t = (s_t[:, None] * (U_t.T @ Y_t)) ** 2  ## (p, p_y)
+            alpha2_t = (s_t[:, None] * (U_t.T @ Y_t)) ** 2  ## (k, p_y)
             Y_var_t = torch.sum(Y_t ** 2, dim=0)  ## (p_y,)
+
+            ## Centering X and Y (the intercept) removes one dimension. With a
+            ## flat prior on the intercept, the marginal likelihood is that of
+            ## the centered data in the remaining (n - 1)-dimensional space, so
+            ## Eq. 19 uses n - 1 observations. With n, the NLL falls like
+            ## log(lambda) as lambda -> 0 whenever centered X fits centered Y
+            ## exactly (rank n - 1, e.g. p_x >= n), and the search returns ~0.
+            n_obs_centered = n - 1
 
             ## Coarse sweep for bracket bounds, then golden-section refinement
             bounds_t, hit_cap_t = _vectorized_nll_sweep(
-                q=q, d2=d2_t[:q], alpha2=alpha2_t[:q, :], n=n, Y_var=Y_var_t,
+                q=q, d2=d2_t[:q], alpha2=alpha2_t[:q, :], n=n_obs_centered, Y_var=Y_var_t,
             )
             lambdas_opt_t, gs_failed_t = _vectorized_golden_section(
-                d2=d2_t[:q], alpha2=alpha2_t[:q, :], n=n, Y_var=Y_var_t,
+                d2=d2_t[:q], alpha2=alpha2_t[:q, :], n=n_obs_centered, Y_var=Y_var_t,
                 q=q, bounds=bounds_t,
             )
 
+            ## Flag interpolating fits: those that leave less than half a
+            ## residual degree of freedom, (n - 1) - sum_j d_j^2 / (d_j^2 + L).
+            ## This needs rank n - 1 (e.g. p_x >= n - 1); with lower rank at
+            ## least n - 1 - q >= 1 remains. With rank n - 1 the NLL stays
+            ## finite as lambda -> 0, so its minimum can be at lambda = 0.
+            ## Broadcast: d2 (q,1) / (d2 (q,1) + L (1,p_y)) -> (q, p_y), sum over q
+            dof_residual_t = (n - 1) - torch.sum(
+                d2_t[:q, None] / (d2_t[:q, None] + lambdas_opt_t[None, :]), dim=0
+            )  ## (p_y,)
+            interpolates_t = dof_residual_t < 0.5  ## (p_y,)
+
             lambdas_final = lambdas_opt_t.cpu().numpy()  ## (p_y,)
-            convergence_failures = (hit_cap_t | gs_failed_t).cpu().numpy()
+            convergence_failures = (hit_cap_t | gs_failed_t | interpolates_t).cpu().numpy()
 
             del Y_t, U_t, s_t, d2_t, alpha2_t, Y_var_t
-            del bounds_t, hit_cap_t, lambdas_opt_t, gs_failed_t
+            del bounds_t, hit_cap_t, lambdas_opt_t, gs_failed_t, dof_residual_t, interpolates_t
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
         else:
