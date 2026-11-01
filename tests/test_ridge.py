@@ -179,6 +179,57 @@ def test_errors():
         Ridge(prefit_includes_alpha=False).fit(X, y, alpha=np.ones(N_TARGETS + 1))
 
 
+def make_data_int(n_samples, n_features, n_targets=N_TARGETS, seed=0):
+    """Integer X with nonzero means, and float y."""
+    rng = np.random.default_rng(seed)
+    X = rng.integers(0, 7, size=(n_samples, n_features))  ## int64
+    W = rng.normal(size=(n_features, n_targets))
+    y = X @ W + 5.0 + rng.normal(size=(n_samples, n_targets))
+    return X, y
+
+
+## Fractional penalties, which an integer dtype would truncate (0.5 -> 0).
+## Torch integer tensors are not tested because they raise errors in both
+## prefit modes.
+MODES_AND_ALPHAS_FRACTIONAL = (
+    [(prefit_includes_alpha, alpha) for prefit_includes_alpha in [True, False] for alpha in [0.5, 1.5]]
+    + [(False, np.array([0.25, 0.5, 1.5, 2.5]))]  ## one per target column
+)
+
+@pytest.mark.parametrize('shape', SHAPES)
+@pytest.mark.parametrize('fit_intercept', [True, False])
+@pytest.mark.parametrize('use_prefit', [False, True])
+@pytest.mark.parametrize('prefit_includes_alpha, alpha', MODES_AND_ALPHAS_FRACTIONAL)
+def test_integer_X_matches_float_X_and_sklearn(shape, fit_intercept, use_prefit, prefit_includes_alpha, alpha):
+    X_int, y = make_data_int(*shape)
+    X_float = X_int.astype(np.float64)
+    kwargs = dict(alpha=alpha, fit_intercept=fit_intercept, prefit_includes_alpha=prefit_includes_alpha)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)  ## the default mode warns for n_features >= n_samples
+        model_int = Ridge(prefit_X=X_int if use_prefit else None, **kwargs).fit(X_int, y)
+        model_float = Ridge(prefit_X=X_float if use_prefit else None, **kwargs).fit(X_float, y)
+    model_sk = sklearn.linear_model.Ridge(alpha=alpha, fit_intercept=fit_intercept, solver='svd').fit(X_float, y)
+
+    np.testing.assert_allclose(model_int.coef_, model_float.coef_, **TOLERANCES)
+    np.testing.assert_allclose(model_int.intercept_, model_float.intercept_, **TOLERANCES)
+    np.testing.assert_allclose(model_int.coef_, model_sk.coef_.T, **TOLERANCES)
+    np.testing.assert_allclose(model_int.intercept_, model_sk.intercept_, **TOLERANCES)
+
+
+@pytest.mark.parametrize('fit_intercept', [True, False])
+@pytest.mark.parametrize('prefit_includes_alpha', [True, False])
+def test_integer_X_rank_deficient(fit_intercept, prefit_includes_alpha):
+    """A column of zeros gives a zero singular value, where a penalty truncated to zero would give NaN coefficients."""
+    X_int, y = make_data_int(100, 20)
+    X_int[:, 0] = 0
+    model = Ridge(alpha=0.5, fit_intercept=fit_intercept, prefit_includes_alpha=prefit_includes_alpha).fit(X_int, y)
+    model_sk = sklearn.linear_model.Ridge(alpha=0.5, fit_intercept=fit_intercept, solver='svd').fit(X_int.astype(np.float64), y)
+
+    assert np.all(np.isfinite(model.coef_)) and np.all(np.isfinite(model.intercept_))
+    np.testing.assert_allclose(model.coef_, model_sk.coef_.T, **TOLERANCES)
+    np.testing.assert_allclose(model.intercept_, model_sk.intercept_, **TOLERANCES)
+
+
 @pytest.mark.parametrize('shape', SHAPES)
 @pytest.mark.parametrize('fit_intercept', [True, False])
 @pytest.mark.parametrize('use_prefit', [False, True])
