@@ -532,7 +532,7 @@ class Ridge(LinearRegression_sk):
         else:
             ## theta = V @ diag(s / (s**2 + alpha)) @ U.T @ y, which equals inv(X.T @ X + alpha*I) @ X.T @ y
             U, s, Vt = self.prefit_svd(X) if self.svd_X is None else self.svd_X
-            alpha = as_array(self.alpha if alpha is None else alpha)
+            alpha = as_array(self.alpha if alpha is None else alpha, dtype=s.dtype)  ## s is floating point; X's dtype may be integer and would truncate alpha
             y_2d = y[:, None] if y.ndim == 1 else y  ## (n_samples, n_targets)
             assert alpha.ndim == 0 or alpha.shape == (y_2d.shape[1],), 'alpha must be a scalar or have one value per target column of y'
 
