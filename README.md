@@ -10,6 +10,7 @@ A very simple library containing closed-form linear regression models using PyTo
 - **Ridge** -- Ridge regression: `(X'X + lambda*I)^-1 X'Y`. The penalty is a fixed scalar, or, with `prefit_includes_alpha=False`, can change on every fit and differ per column of Y. The intercept is not penalized, as in scikit-learn's `Ridge`
 - **ReducedRankRidgeRegression** -- Ridge regression followed by SVD truncation of the weight matrix. The intercept is not penalized
 - **RidgeMML** -- Ridge regression with automatic per-column lambda estimation ([Karabatsos 2017](http://www.tandfonline.com/doi/pdf/10.1080/03610918.2017.1321119)).
+- **lars_elastic_net_path** -- Exact elastic-net path for a fixed L2 penalty, by least angle regression with the lasso modification (LARS-EN; Zou & Hastie 2005). Records the order in which features enter and drop out.
 
 The closed-form approach results in fast and accurate results under most
 conditions. However, when `n_features` is large and/or very underdetermined
@@ -126,3 +127,40 @@ Key differences from `Ridge`:
 | X standardization | None | Intrinsic z-scoring (ddof=1) |
 | Intercept | Optional, not penalized | Always (derived from column means) |
 | Dependencies | numpy, torch | numpy, torch |
+
+### LARS elastic-net path
+`lars_elastic_net_path` minimizes
+`(1/(2n))||y - Xb||^2 + lambda1*||b||_1 + (lambda2/2)*||b||^2` for a fixed
+`lambda2` and every `lambda1`, from the value where the first feature enters
+down to `lambda1_min`. This is the convention of sklearn's `ElasticNet`
+(`alpha*l1_ratio = lambda1`, `alpha*(1 - l1_ratio) = lambda2`). It returns one
+event per step (the feature that entered or dropped, and its sign), `lambda1`
+at each knot, and the coefficients at each knot as active indices plus values.
+Events that happen at the same `lambda1` (for example, exact copies of a
+column) share a value of `events_group`; their order within the group is
+arbitrary. Each step makes one product with `X` and never forms the
+`(n_features, n_features)` Gram, so it suits very wide `X` when only the first
+few dozen steps are needed. It fits one target, with no centering or
+intercept: center `X` and `y` first. Use float64 when the order of features
+matters; float32 can swap features that enter within about 1e-4 of `lambda1`
+of each other. Tested against sklearn's `lars_path`, `lars_path_gram` and
+`ElasticNet`, and against R's `elasticnet::enet`, in float64.
+
+```python
+X = np.random.randn(200, 5000)
+y = X[:, :5] @ np.random.randn(5) + np.random.randn(200)
+X, y = X - X.mean(axis=0), y - y.mean()
+
+path = tlr.lars_elastic_net_path(X=X, y=y, lambda2=0.1, max_steps=30)
+print(path['events_index'], path['events_type'])  ## feature order; +1 entered, -1 dropped
+print(path['events_sign'], path['events_group'])  ## coefficient sign; equal groups = same lambda1
+print(path['lambda1s'])  ## lambda1 at each knot
+lambda1 = 0.5 * (path['lambda1s'][5] + path['lambda1s'][6]).item()  ## between knots 5 and 6
+coef = tlr.interpolate_lars_path(path, lambda1=lambda1)  ## dense, shape (n_features,)
+```
+
+If the active-set Gram becomes singular (duplicate or collinear columns with
+`lambda2 = 0`), the function raises `tlr.SingularGramError`, a `ValueError`
+whose `path` attribute holds the path computed up to that point.
+
+Version 0.4.0 added `lars_elastic_net_path` and `interpolate_lars_path`.
